@@ -1,3 +1,4 @@
+
 # app.py - Railway Optimized Version
 import os
 from flask import Flask, request, jsonify, render_template_string, send_from_directory, Response
@@ -372,7 +373,7 @@ def api_verify():
         
         # Check if already verified
         if users[uid].get('verified'):
-            return jsonify({'ok': True, 'msg': 'Already verified'})
+            return jsonify({'ok': True, 'msg': 'Already verified', 'balance': users[uid].get('balance', 0)})
         
         # Check channel membership
         if settings['channels']:
@@ -432,7 +433,7 @@ def api_verify():
                             "amount": reward,
                             "upi": "-",
                             "status": "completed",
-                            "date": datetime.now().strftime("%Y-%m-d %H:%M")
+                            "date": datetime.now().strftime("%Y-%m-%d %H:%M")
                         })
                         save_json(WITHDRAWALS_FILE, w_list)
                         
@@ -452,7 +453,7 @@ def api_verify():
             "date": datetime.now().strftime("%Y-%m-%d %H:%M")
         })
         save_json(WITHDRAWALS_FILE, w_list)
-        return jsonify({'ok': True, 'bonus': bonus})
+        return jsonify({'ok': True, 'bonus': bonus, 'balance': users[uid]['balance']})
     
     except Exception as e:
         logger.error(f"Verify error: {e}")
@@ -527,12 +528,32 @@ def api_withdraw():
             'msg': msg_client, 
             'auto': is_auto, 
             'utr': record.get('utr', ''), 
-            'tx_id': tx_id
+            'tx_id': tx_id,
+            'new_balance': users[uid]['balance']
         })
         
     except Exception as e:
         logger.error(f"Withdraw Error: {e}")
         return jsonify({'ok': False, 'msg': f"Error: {str(e)}"})
+
+@app.route('/api/get_balance')
+def api_get_balance():
+    try:
+        uid = request.args.get('user_id')
+        if not uid:
+            return jsonify({'ok': False, 'msg': 'User ID required'})
+        
+        users = load_json(USERS_FILE, {})
+        user = users.get(str(uid), {})
+        
+        return jsonify({
+            'ok': True,
+            'balance': float(user.get('balance', 0)),
+            'verified': user.get('verified', False)
+        })
+    except Exception as e:
+        logger.error(f"Get balance error: {e}")
+        return jsonify({'ok': False, 'msg': str(e)})
 
 @app.route('/api/history')
 def api_history():
@@ -557,7 +578,7 @@ def api_contact():
         if not uid:
             return jsonify({'ok': False, 'msg': 'User ID required'})
             
-        cap = f"📩 *Msg from {uid}*\n{msg}"
+        cap = f"📩 *Message from {uid}*\n{msg}"
         recipients = [ADMIN_ID] + get_settings().get('admins', [])
         
         if f:
@@ -645,7 +666,8 @@ def api_claim_gift():
                 return jsonify({
                     'ok': True, 
                     'msg': f'🎉 Gift code claimed! ₹{amount} added to your balance',
-                    'amount': amount
+                    'amount': amount,
+                    'new_balance': users[uid]['balance']
                 })
         
         return jsonify({'ok': False, 'msg': 'Invalid gift code'})
@@ -736,12 +758,25 @@ def admin_panel():
                 except:
                     gift['remaining_minutes'] = 0
         
+        users = load_json(USERS_FILE, {})
+        # Prepare user data for the table
+        user_list = []
+        for user_id, user_data in users.items():
+            user_list.append({
+                'id': user_id,
+                'name': user_data.get('name', 'Unknown'),
+                'balance': float(user_data.get('balance', 0)),
+                'refer_code': user_data.get('refer_code', 'N/A'),
+                'verified': user_data.get('verified', False),
+                'refer_count': len(user_data.get('referred_users', []))
+            })
+        
         return render_template_string(ADMIN_TEMPLATE, 
             settings=get_settings(), 
-            users=load_json(USERS_FILE, {}), 
+            users=user_list,
             withdrawals=filtered_withdrawals[::-1], 
             stats={
-                "total_users": len(load_json(USERS_FILE, {})), 
+                "total_users": len(users), 
                 "pending_count": len([w for w in filtered_withdrawals if w.get('status') == 'pending'])
             },
             timestamp=int(time.time()),
@@ -1033,7 +1068,7 @@ MINI_APP_TEMPLATE = """
         .card-silver { background: linear-gradient(135deg, #c0c0c0 0%, #d0d0d0 30%, #e0e0e0 50%, #d0d0d0 70%, #c0c0c0 100%); border: 1px solid #fff; box-shadow: 0 10px 20px rgba(0,0,0,0.3); color: #222; text-align: center; aspect-ratio: 16/9; display: flex; flex-direction: column; justify-content: center; align-items: center; }
         .card-purple { background: linear-gradient(135deg, #9d4edd 0%, #7b2cbf 50%, #5a189a 100%); border: 1px solid #c77dff; box-shadow: 0 0 20px rgba(157,78,221,0.5); color: white; text-align: center; aspect-ratio: 16/9; display: flex; flex-direction: column; justify-content: center; align-items: center; position: relative; padding: 20px; }
         .card-purple::before { content: ''; position: absolute; top: -10px; left: -10px; right: -10px; bottom: -10px; background: linear-gradient(45deg, #9d4edd, #7b2cbf, #5a189a, #9d4edd); z-index: -1; border-radius: 20px; opacity: 0.5; filter: blur(10px); }
-        .btn { background: #111; color: var(--gold); border: none; padding: 14px 30px; border-radius: 30px; font-weight: 800; font-size: 16px; margin-top: 15px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 10px; font-family: 'Rajdhani'; box-shadow: 0 5px 15px rgba(0,0,0,0.3); transition: transform 0.2s; position: relative; z-index: 5; width: 100%; }
+        .btn { background: #111; color: var(--gold); border: none; padding: 14px 30px; border-radius: 30px; font-weight: 800; font-size: 16px; margin-top: 15px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 10px; font-family: 'Rajdhani'; box-shadow: 0 5px 15px rgba(0,0,0,0.3); transition: transform 0.2s; position: relative; z-index: 5; }
         .btn:active { transform: scale(0.95); }
         .btn-purple { background: #5a189a; color: white; }
         .btn-cyan { background: #00f3ff; color: #000; }
@@ -1046,7 +1081,7 @@ MINI_APP_TEMPLATE = """
         .overlay-loader { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.95); z-index: 2000; display: flex; flex-direction: column; justify-content: center; align-items: center; }
         .spinner { width: 40px; height: 40px; border: 5px solid #333; border-top: 5px solid var(--cyan); border-radius: 50%; animation: spin 1s linear infinite; margin: 20px; }
         @keyframes spin { to { transform: rotate(360deg); } }
-        .refer-code-box { background: rgba(255,255,255,0.1); border: 2px dashed var(--cyan); padding: 15px; border-radius: 10px; margin: 10px 0; font-family: monospace; font-size: 24px; letter-spacing: 3px; cursor: pointer; width: 100%; text-align: center; word-break: break-all; }
+        .refer-code-box { background: rgba(255,255,255,0.1); border: 2px dashed var(--cyan); padding: 15px 10px; border-radius: 10px; margin: 10px 0; font-family: monospace; font-size: 24px; letter-spacing: 3px; cursor: pointer; text-align: center; word-break: break-all; margin-left: 20px; margin-right: 20px; }
         .leaderboard-table { width: 100%; border-collapse: collapse; margin-top: 15px; font-size: 14px; }
         .leaderboard-table tr { border-bottom: 1px solid rgba(255,255,255,0.1); }
         .leaderboard-table td { padding: 10px 5px; }
@@ -1064,9 +1099,22 @@ MINI_APP_TEMPLATE = """
         .balance-loading { font-size: 48px; font-weight: 900; margin: 5px 0; text-shadow: 0 2px 5px rgba(0,0,0,0.2); color: #666; }
         .skeleton { background: linear-gradient(90deg, #333 25%, #444 50%, #333 75%); background-size: 200% 100%; animation: loading 1.5s infinite; }
         @keyframes loading { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+        .action-loading { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); z-index: 99999; justify-content: center; align-items: center; flex-direction: column; }
+        .action-loader { font-size: 16px; color: white; margin-top: 15px; font-weight: bold; }
+        .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #333; color: white; padding: 12px 24px; border-radius: 8px; z-index: 10000; display: none; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
+        .toast-success { background: #28a745; }
+        .toast-error { background: #dc3545; }
+        .toast-info { background: #17a2b8; }
     </style>
 </head>
 <body>
+    <div id="action-loading" class="action-loading">
+        <div class="spinner"></div>
+        <div id="action-loader-text" class="action-loader">Processing...</div>
+    </div>
+    
+    <div id="toast" class="toast"></div>
+    
     <div id="loader" class="overlay-loader"><div class="spinner"></div><div id="loader-txt" style="color:#fff; font-weight:bold; font-size:18px;">LOADING...</div></div>
     
     <div id="app" class="hidden" style="width:100%; display:flex; flex-direction:column; align-items:center;">
@@ -1102,7 +1150,7 @@ MINI_APP_TEMPLATE = """
             
             <div class="card-gold">
                 <div style="font-size:14px; font-weight:800; opacity:0.8; letter-spacing:2px;">WALLET BALANCE</div>
-                <div id="balance-amount" class="balance-loading">Loading...</div>
+                <div id="balance-amount" style="font-size:48px; font-weight:900; margin:5px 0; text-shadow:0 2px 5px rgba(0,0,0,0.2);">₹{{ "%.2f"|format(user.balance) }}</div>
                 <button class="btn" onclick="openPop('withdraw')"><i class="fas fa-wallet"></i> WITHDRAW</button>
             </div>
             
@@ -1223,37 +1271,50 @@ MINI_APP_TEMPLATE = """
         };
         
         function loadCriticalData() {
-            // Update balance immediately
-            updateBalance();
-            
             // Load history
             loadHistory();
+            
+            // Load refer info if needed
+            loadReferInfo();
             
             // Check verification in background
             if (!isVerified) {
                 checkVerification();
             }
+        }
+        
+        function showActionLoader(text = 'Processing...') {
+            document.getElementById('action-loader-text').textContent = text;
+            document.getElementById('action-loading').style.display = 'flex';
+        }
+        
+        function hideActionLoader() {
+            document.getElementById('action-loading').style.display = 'none';
+        }
+        
+        function showToast(message, type = 'info', duration = 3000) {
+            const toast = document.getElementById('toast');
+            toast.textContent = message;
+            toast.className = 'toast';
+            toast.classList.add('toast-' + type);
+            toast.style.display = 'block';
             
-            // Load refer info if needed
-            loadReferInfo();
+            setTimeout(() => {
+                toast.style.display = 'none';
+            }, duration);
         }
         
         function updateBalance() {
             // Quick balance update from server
-            fetch('/mini_app?user_id=' + UID)
-                .then(r => r.text())
-                .then(html => {
-                    const tempDiv = document.createElement('div');
-                    tempDiv.innerHTML = html;
-                    const balanceElement = tempDiv.querySelector('.card-gold div:nth-child(2)');
-                    if (balanceElement) {
-                        document.getElementById('balance-amount').textContent = balanceElement.textContent;
-                        document.getElementById('balance-amount').classList.remove('balance-loading');
+            fetch('/api/get_balance?user_id=' + UID)
+                .then(r => r.json())
+                .then(data => {
+                    if (data.ok) {
+                        document.getElementById('balance-amount').textContent = '₹' + data.balance.toFixed(2);
                     }
                 })
                 .catch(() => {
-                    document.getElementById('balance-amount').textContent = '₹{{ "%.2f"|format(user.balance) }}';
-                    document.getElementById('balance-amount').classList.remove('balance-loading');
+                    // Keep current balance on error
                 });
         }
         
@@ -1272,14 +1333,12 @@ MINI_APP_TEMPLATE = """
                     document.getElementById('pop-verify').style.display = 'flex';
                 } else if (data.ok && data.bonus > 0) {
                     // Bonus received
+                    showToast(`🎉 Bonus received! ₹${data.bonus} added to your balance`, 'success', 5000);
                     updateBalance();
                     loadHistory();
-                    // Show quick notification
-                    setTimeout(() => {
-                        if (typeof confetti === 'function') {
-                            confetti({particleCount: 100, spread: 70});
-                        }
-                    }, 500);
+                    if (typeof confetti === 'function') {
+                        confetti({particleCount: 100, spread: 70});
+                    }
                 }
             })
             .catch(err => console.log('Verification check skipped'));
@@ -1309,16 +1368,13 @@ MINI_APP_TEMPLATE = """
             const amount = document.getElementById('w-amt').value;
             
             if (!upi || !amount) {
-                alert('Please fill all fields');
+                showToast('Please fill all fields', 'error');
                 return;
             }
             
             closePop();
             
-            // Show quick loading
-            const originalText = event.target.textContent;
-            event.target.innerHTML = '<div class="spinner" style="width:20px;height:20px;border-width:3px;"></div>';
-            event.target.disabled = true;
+            showActionLoader('Processing withdrawal...');
             
             fetch('/api/withdraw', {
                 method: 'POST',
@@ -1327,26 +1383,29 @@ MINI_APP_TEMPLATE = """
             })
             .then(r => r.json())
             .then(data => {
-                event.target.innerHTML = originalText;
-                event.target.disabled = false;
+                hideActionLoader();
                 
                 if (data.ok) {
-                    alert(data.msg);
+                    showToast(data.msg, 'success', 5000);
                     if (data.auto) {
                         if (typeof confetti === 'function') {
                             confetti({particleCount: 150, spread: 80});
                         }
                     }
-                    updateBalance();
+                    // Update balance with new value from server
+                    if (data.new_balance !== undefined) {
+                        document.getElementById('balance-amount').textContent = '₹' + data.new_balance.toFixed(2);
+                    } else {
+                        updateBalance();
+                    }
                     loadHistory();
                 } else {
-                    alert(data.msg);
+                    showToast(data.msg, 'error');
                 }
             })
             .catch(err => {
-                event.target.innerHTML = originalText;
-                event.target.disabled = false;
-                alert('Withdrawal failed. Please try again.');
+                hideActionLoader();
+                showToast('Withdrawal failed. Please try again.', 'error');
                 console.error('Withdraw error:', err);
             });
         }
@@ -1356,9 +1415,11 @@ MINI_APP_TEMPLATE = """
             const fileInput = document.getElementById('c-file');
             
             if (!message.trim()) {
-                alert('Please enter a message');
+                showToast('Please enter a message', 'error');
                 return;
             }
+            
+            showActionLoader('Sending message...');
             
             const formData = new FormData();
             formData.append('user_id', UID);
@@ -1373,17 +1434,19 @@ MINI_APP_TEMPLATE = """
             })
             .then(r => r.json())
             .then(data => {
+                hideActionLoader();
                 if (data.ok) {
-                    alert('Message sent successfully!');
+                    showToast('Message sent successfully!', 'success');
                     closePop();
                     document.getElementById('c-msg').value = '';
                     document.getElementById('c-file').value = '';
                 } else {
-                    alert('Failed to send: ' + data.msg);
+                    showToast('Failed to send: ' + data.msg, 'error');
                 }
             })
             .catch(err => {
-                alert('Failed to send message');
+                hideActionLoader();
+                showToast('Failed to send message', 'error');
                 console.error('Contact error:', err);
             });
         }
@@ -1415,6 +1478,8 @@ MINI_APP_TEMPLATE = """
             })
             .catch(err => {
                 console.error('History error:', err);
+                const container = document.getElementById('history-list');
+                container.innerHTML = '<div style="text-align:center; color:#555; padding:20px;">Failed to load history</div>';
             });
         }
         
@@ -1444,6 +1509,7 @@ MINI_APP_TEMPLATE = """
             })
             .catch(err => {
                 console.error('Refer info error:', err);
+                document.getElementById('refer-code-display').textContent = 'ERROR';
             });
         }
         
@@ -1453,15 +1519,9 @@ MINI_APP_TEMPLATE = """
             navigator.clipboard.writeText(referData.refer_code)
                 .then(() => {
                     // Quick feedback
-                    const original = document.getElementById('refer-code-display').textContent;
-                    document.getElementById('refer-code-display').textContent = 'COPIED!';
-                    document.getElementById('refer-code-display').style.color = '#0f0';
-                    setTimeout(() => {
-                        document.getElementById('refer-code-display').textContent = original;
-                        document.getElementById('refer-code-display').style.color = '';
-                    }, 1000);
+                    showToast('Refer code copied!', 'success', 2000);
                 })
-                .catch(() => alert('Failed to copy'));
+                .catch(() => showToast('Failed to copy', 'error'));
         }
         
         function shareReferLink() {
@@ -1476,14 +1536,11 @@ MINI_APP_TEMPLATE = """
             const code = document.getElementById('gift-code').value.trim().toUpperCase();
             
             if (!code || code.length !== 5) {
-                alert('Please enter a valid 5-character code');
+                showToast('Please enter a valid 5-character code', 'error');
                 return;
             }
             
-            // Show loading
-            const originalText = event.target.textContent;
-            event.target.innerHTML = '<div class="spinner" style="width:20px;height:20px;border-width:3px;"></div>';
-            event.target.disabled = true;
+            showActionLoader('Claiming gift...');
             
             fetch('/api/claim_gift', {
                 method: 'POST',
@@ -1492,23 +1549,29 @@ MINI_APP_TEMPLATE = """
             })
             .then(r => r.json())
             .then(data => {
-                event.target.innerHTML = originalText;
-                event.target.disabled = false;
+                hideActionLoader();
                 
                 const resultDiv = document.getElementById('gift-result');
                 if (data.ok) {
                     resultDiv.innerHTML = `<div style="color:#0f0; font-weight:bold; font-size:18px;">${data.msg}</div>`;
                     document.getElementById('gift-code').value = '';
                     
+                    showToast(data.msg, 'success', 5000);
+                    
                     if (typeof confetti === 'function') {
                         confetti({particleCount: 200, spread: 90});
                     }
                     
-                    // Update balance
-                    updateBalance();
+                    // Update balance with new value from server
+                    if (data.new_balance !== undefined) {
+                        document.getElementById('balance-amount').textContent = '₹' + data.new_balance.toFixed(2);
+                    } else {
+                        updateBalance();
+                    }
                     loadHistory();
                 } else {
                     resultDiv.innerHTML = `<div style="color:#f44; font-weight:bold;">${data.msg}</div>`;
+                    showToast(data.msg, 'error');
                 }
                 
                 // Clear result after 5 seconds
@@ -1517,9 +1580,8 @@ MINI_APP_TEMPLATE = """
                 }, 5000);
             })
             .catch(err => {
-                event.target.innerHTML = originalText;
-                event.target.disabled = false;
-                alert('Failed to claim gift code');
+                hideActionLoader();
+                showToast('Failed to claim gift code', 'error');
                 console.error('Claim error:', err);
             });
         }
@@ -1571,21 +1633,24 @@ ADMIN_TEMPLATE = """
 <head>
     <title>Admin Panel</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
         body { background: #111; color: #ddd; font-family: sans-serif; margin: 0; padding-bottom: 50px; }
         .nav { background: #222; padding: 10px; display: flex; overflow-x: auto; gap: 10px; position: sticky; top: 0; z-index: 100; border-bottom: 1px solid #333; }
-        .nav button { background: none; border: none; color: #888; padding: 10px; font-weight: bold; cursor: pointer; white-space: nowrap; border-radius: 5px; }
+        .nav button { background: none; border: none; color: #888; padding: 10px; font-weight: bold; cursor: pointer; white-space: nowrap; border-radius: 5px; display: flex; align-items: center; gap: 5px; }
+        .nav button i { font-size: 14px; }
         .nav button.active { background: #007bff; color: white; }
         .tab { display: none; padding: 15px; } .tab.active { display: block; }
         .card { background: #222; padding: 15px; border-radius: 8px; margin-bottom: 15px; border: 1px solid #333; }
         input, select, textarea { width: 100%; padding: 10px; background: #333; border: 1px solid #444; color: white; margin: 5px 0; border-radius: 5px; box-sizing: border-box; }
-        .btn { width: 100%; padding: 12px; background: #007bff; color: white; border: none; border-radius: 5px; margin-top: 10px; font-weight: bold; cursor: pointer;}
-        .btn-del { width: auto; background: #dc3545; padding: 5px 10px; margin: 0; font-size: 12px; cursor: pointer;}
+        .btn { padding: 12px; background: #007bff; color: white; border: none; border-radius: 5px; margin-top: 10px; font-weight: bold; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px; }
+        .btn-block { width: 100%; }
+        .btn-del { width: auto; background: #dc3545; padding: 5px 10px; margin: 0; font-size: 12px; cursor: pointer; }
         .btn-icon { width:35px; height:35px; border-radius:5px; border:none; cursor:pointer; font-weight:bold; font-size:16px; margin-left:5px; display:inline-flex; align-items:center; justify-content:center; }
         .check { background:#28a745; color:white; } .cross { background:#dc3545; color:white; }
         table { width: 100%; border-collapse: collapse; font-size: 13px; } 
         th { text-align: left; color: #888; border-bottom: 1px solid #444; padding:8px; } 
-        td { padding: 8px; border-bottom: 1px solid #333; vertical-align: middle; }
+        td { padding: 8px; border-bottom: 1px solid #333; vertical-align: top; }
         .tx-id { font-weight:bold; color:#007bff; display:block; }
         .u-info { font-size:11px; color:#aaa; display:block; }
         .paid-utr { font-family:monospace; color:#28a745; background:rgba(40,167,69,0.1); padding:2px 5px; border-radius:4px; font-size:11px; }
@@ -1598,27 +1663,62 @@ ADMIN_TEMPLATE = """
         .nowrap { white-space: nowrap; }
         .expired { opacity: 0.5; text-decoration: line-through; }
         .gen-btn { background: #9d4edd; color: white; border: none; padding: 8px 15px; border-radius: 5px; cursor: pointer; font-size: 12px; margin-left: 10px; }
+        .user-cell-left { width: 35%; }
+        .user-cell-middle { width: 30%; text-align: center; }
+        .user-cell-right { width: 35%; text-align: right; }
+        .user-name { font-weight: bold; font-size: 14px; }
+        .user-id { font-size: 11px; color: #888; margin-top: 2px; }
+        .user-balance { font-weight: bold; font-size: 16px; color: #ffc107; }
+        .user-verified { font-size: 11px; color: #28a745; margin-top: 2px; }
+        .user-unverified { font-size: 11px; color: #dc3545; margin-top: 2px; }
+        .user-refer-code { font-family: monospace; font-size: 13px; font-weight: bold; }
+        .user-ref-count { font-size: 11px; color: #888; margin-top: 2px; }
+        .action-loading { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); z-index: 99999; justify-content: center; align-items: center; flex-direction: column; }
+        .spinner { width: 40px; height: 40px; border: 5px solid #333; border-top: 5px solid #007bff; border-radius: 50%; animation: spin 1s linear infinite; margin: 20px; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .action-loader { font-size: 16px; color: white; margin-top: 15px; font-weight: bold; }
+        .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #333; color: white; padding: 12px 24px; border-radius: 8px; z-index: 10000; display: none; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
+        .toast-success { background: #28a745; }
+        .toast-error { background: #dc3545; }
+        .toast-info { background: #17a2b8; }
+        .search-box { margin-bottom: 15px; position: relative; }
+        .search-box input { padding-left: 35px; }
+        .search-box i { position: absolute; left: 10px; top: 50%; transform: translateY(-50%); color: #888; }
     </style>
 </head>
 <body>
-    <div class="nav">
-        <button class="active" onclick="tab('dash')">Stats</button>
-        <button onclick="tab('withs')">Withdraws</button>
-        <button onclick="tab('users')">Users</button>
-        <button onclick="tab('sets')">Config</button>
-        <button onclick="tab('chans')">Channels</button>
-        <button onclick="tab('admins')">Admins</button>
-        <button onclick="tab('gifts')">Gift Codes</button>
-        <button onclick="tab('bc')">Broadcast</button>
+    <div id="action-loading" class="action-loading">
+        <div class="spinner"></div>
+        <div id="action-loader-text" class="action-loader">Processing...</div>
     </div>
     
-    <div id="approveModal" class="modal"><div class="m-content"><h3>Enter UTR</h3><input id="utrInput" placeholder="UTR Number"><button class="btn" style="background:#28a745" onclick="confirmApprove()">Confirm Pay</button><button class="btn" style="background:transparent; color:#f44" onclick="document.getElementById('approveModal').style.display='none'">Cancel</button></div></div>
+    <div id="toast" class="toast"></div>
+    
+    <div class="nav">
+        <button class="active" onclick="tab('dash')"><i class="fas fa-chart-bar"></i> Stats</button>
+        <button onclick="tab('withs')"><i class="fas fa-money-bill-wave"></i> Withdraws</button>
+        <button onclick="tab('users')"><i class="fas fa-users"></i> Users</button>
+        <button onclick="tab('sets')"><i class="fas fa-cog"></i> Config</button>
+        <button onclick="tab('chans')"><i class="fas fa-broadcast-tower"></i> Channels</button>
+        <button onclick="tab('admins')"><i class="fas fa-user-shield"></i> Admins</button>
+        <button onclick="tab('gifts')"><i class="fas fa-gift"></i> Gift Codes</button>
+        <button onclick="tab('bc')"><i class="fas fa-bullhorn"></i> Broadcast</button>
+    </div>
+    
+    <div id="approveModal" class="modal">
+        <div class="m-content">
+            <h3>Enter UTR</h3>
+            <input id="utrInput" placeholder="UTR Number">
+            <button class="btn" style="background:#28a745" onclick="confirmApprove()">Confirm Pay</button>
+            <button class="btn" style="background:transparent; color:#f44" onclick="document.getElementById('approveModal').style.display='none'">Cancel</button>
+        </div>
+    </div>
     
     <div id="dash" class="tab active">
         <div class="card">
-            <h3>Total Users: <span style="color:#007bff">{{ stats.total_users }}</span></h3>
-            <h3>Pending Withdrawals: <span style="color:#ffc107">{{ stats.pending_count }}</span></h3>
-            <h3>Active Gift Codes: <span style="color:#9d4edd">{{ gifts|length }}</span></h3>
+            <h3><i class="fas fa-users" style="color:#007bff; margin-right:10px;"></i>Total Users: <span style="color:#007bff">{{ stats.total_users }}</span></h3>
+            <h3><i class="fas fa-clock" style="color:#ffc107; margin-right:10px;"></i>Pending Withdrawals: <span style="color:#ffc107">{{ stats.pending_count }}</span></h3>
+            <h3><i class="fas fa-gift" style="color:#9d4edd; margin-right:10px;"></i>Active Gift Codes: <span style="color:#9d4edd">{{ gifts|length }}</span></h3>
         </div>
     </div>
     
@@ -1639,8 +1739,8 @@ ADMIN_TEMPLATE = """
                     </td>
                     <td style="text-align:right;">
                         {% if w.status == 'pending' %}
-                        <button class="btn-icon check" onclick="openApprove('{{ w.tx_id }}')">✔</button>
-                        <button class="btn-icon cross" onclick="proc('{{ w.tx_id }}','rejected')">✘</button>
+                        <button class="btn-icon check" onclick="openApprove('{{ w.tx_id }}')" title="Approve">✔</button>
+                        <button class="btn-icon cross" onclick="processWithdrawal('{{ w.tx_id }}','rejected')" title="Reject">✘</button>
                         {% elif w.status == 'completed' %}
                         <span class="paid-utr">{{ w.utr }}</span>
                         {% else %}
@@ -1648,6 +1748,8 @@ ADMIN_TEMPLATE = """
                         {% endif %}
                     </td>
                 </tr>
+                {% else %}
+                <tr><td colspan="2" style="text-align:center; padding:20px; color:#888;">No withdrawal requests</td></tr>
                 {% endfor %}
             </table>
         </div>
@@ -1655,73 +1757,112 @@ ADMIN_TEMPLATE = """
 
     <div id="users" class="tab">
         <div class="card">
-            <input placeholder="Search by name or ID" onkeyup="searchUsers(this)">
-            <table id="uTable">
-                <tr><th>ID</th><th>Name</th><th>Bal</th><th>Refers</th><th>Code</th><th>Verified</th></tr>
-                {% for uid, u in users.items() %}
-                <tr>
-                    <td class="nowrap">{{ uid[:8] }}...</td>
-                    <td>{{ u.name }}</td>
-                    <td>{{ "%.2f"|format(u.balance) }}</td>
-                    <td>{{ u.referred_users|length if u.referred_users else 0 }}</td>
-                    <td style="font-family:monospace; font-size:11px;">{{ u.refer_code if u.refer_code else 'N/A' }}</td>
-                    <td>{% if u.verified %}✅{% else %}❌{% endif %}</td>
-                </tr>
-                {% endfor %}
+            <div class="search-box">
+                <i class="fas fa-search"></i>
+                <input id="userSearch" placeholder="Search by name or ID" onkeyup="searchUsers(this)">
+            </div>
+            <table id="uTable" style="width:100%;">
+                <thead>
+                    <tr style="background:#2a2a30;">
+                        <th class="user-cell-left">USER</th>
+                        <th class="user-cell-middle">REFERRAL</th>
+                        <th class="user-cell-right">BALANCE</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for user in users %}
+                    <tr>
+                        <td class="user-cell-left">
+                            <div class="user-name">{{ user.name }}</div>
+                            <div class="user-id">ID: {{ user.id[:8] }}...</div>
+                        </td>
+                        <td class="user-cell-middle">
+                            <div class="user-refer-code">{{ user.refer_code }}</div>
+                            <div class="user-ref-count">Refers: {{ user.refer_count }}</div>
+                        </td>
+                        <td class="user-cell-right">
+                            <div class="user-balance">₹{{ "%.2f"|format(user.balance) }}</div>
+                            {% if user.verified %}
+                            <div class="user-verified">✅ VERIFIED</div>
+                            {% else %}
+                            <div class="user-unverified">❌ UNVERIFIED</div>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% else %}
+                    <tr><td colspan="3" style="text-align:center; padding:20px; color:#888;">No users found</td></tr>
+                    {% endfor %}
+                </tbody>
             </table>
         </div>
     </div>
     
     <div id="sets" class="tab">
         <div class="card">
-            <label>Bot Name</label><input id="bName" value="{{ settings.bot_name }}">
-            <label>Min Withdraw (₹)</label><input type="number" id="minW" value="{{ settings.min_withdrawal }}">
-            <label>Welcome Bonus (₹)</label><input type="number" id="bonus" value="{{ settings.welcome_bonus }}">
-            <label>Min Refer Reward (₹)</label><input type="number" id="minRef" value="{{ settings.min_refer_reward }}">
-            <label>Max Refer Reward (₹)</label><input type="number" id="maxRef" value="{{ settings.max_refer_reward }}">
+            <label><i class="fas fa-robot"></i> Bot Name</label>
+            <input id="bName" value="{{ settings.bot_name }}">
+            
+            <label><i class="fas fa-wallet"></i> Min Withdraw (₹)</label>
+            <input type="number" id="minW" value="{{ settings.min_withdrawal }}">
+            
+            <label><i class="fas fa-gift"></i> Welcome Bonus (₹)</label>
+            <input type="number" id="bonus" value="{{ settings.welcome_bonus }}">
+            
+            <label><i class="fas fa-users"></i> Min Refer Reward (₹)</label>
+            <input type="number" id="minRef" value="{{ settings.min_refer_reward }}">
+            
+            <label><i class="fas fa-users"></i> Max Refer Reward (₹)</label>
+            <input type="number" id="maxRef" value="{{ settings.max_refer_reward }}">
+            
             <div style="margin:10px 0">
                 <input type="checkbox" id="dis" style="width:auto" {{ 'checked' if settings.bots_disabled else '' }}> 
-                <label for="dis">Disable Bot for Users</label>
+                <label for="dis"><i class="fas fa-power-off"></i> Disable Bot for Users</label>
             </div>
+            
             <div style="margin:10px 0">
                 <input type="checkbox" id="auto" style="width:auto" {{ 'checked' if settings.auto_withdraw else '' }}> 
-                <label for="auto">Auto-Withdraw (Instant Payment)</label>
+                <label for="auto"><i class="fas fa-bolt"></i> Auto-Withdraw (Instant Payment)</label>
             </div>
+            
             <div style="margin:10px 0">
                 <input type="checkbox" id="idevice" style="width:auto" {{ 'checked' if settings.ignore_device_check else '' }}> 
-                <label for="idevice">Allow Same Device Multiple Accounts</label>
+                <label for="idevice"><i class="fas fa-mobile-alt"></i> Allow Same Device Multiple Accounts</label>
             </div>
+            
             <div style="margin:10px 0">
                 <input type="checkbox" id="withdraw_disabled" style="width:auto" {{ 'checked' if settings.withdraw_disabled else '' }}> 
-                <label for="withdraw_disabled">Disable Withdrawals</label>
+                <label for="withdraw_disabled"><i class="fas fa-ban"></i> Disable Withdrawals</label>
             </div>
-            <button class="btn" onclick="saveBasic()">Save Settings</button>
+            
+            <button class="btn btn-block" onclick="saveBasic()"><i class="fas fa-save"></i> Save Settings</button>
         </div>
+        
         <div class="card">
-            <h3>Upload Logo</h3>
+            <h3><i class="fas fa-image"></i> Upload Logo</h3>
             <input type="file" id="logoFile" accept="image/*">
-            <button class="btn" onclick="upLogo()">Upload Logo</button>
+            <button class="btn btn-block" onclick="uploadLogo()"><i class="fas fa-upload"></i> Upload Logo</button>
             <p style="font-size:12px; color:#888; margin-top:10px;">Current: {{ settings.logo_filename }}</p>
         </div>
     </div>
     
     <div id="chans" class="tab">
         <div class="card">
-            <h3>Add Channel</h3>
+            <h3><i class="fas fa-plus-circle"></i> Add Channel</h3>
             <input id="cName" placeholder="Channel Name (e.g. News Channel)">
             <input id="cLink" placeholder="Channel Link (https://t.me/...)">
             <input id="cId" placeholder="Channel ID (e.g. @channelusername)">
-            <button class="btn" onclick="addChan()">Add Channel</button>
+            <button class="btn btn-block" onclick="addChannel()"><i class="fas fa-plus"></i> Add Channel</button>
             <p style="font-size:12px; color:#888; margin-top:10px;">Users must join these channels to verify</p>
         </div>
+        
         <div class="card">
-            <h3>Current Channels</h3>
+            <h3><i class="fas fa-list"></i> Current Channels</h3>
             <table>
                 {% for ch in settings.channels %}
                 <tr>
-                    <td>{{ ch.btn_name }}</td>
+                    <td><strong>{{ ch.btn_name }}</strong></td>
                     <td style="font-size:11px; color:#888;">{{ ch.id }}</td>
-                    <td><button class="btn-del" onclick="delChan({{ loop.index0 }})">Delete</button></td>
+                    <td><button class="btn-del" onclick="deleteChannel({{ loop.index0 }})"><i class="fas fa-trash"></i> Delete</button></td>
                 </tr>
                 {% else %}
                 <tr><td colspan="3" style="text-align:center; color:#888; padding:20px;">No channels added</td></tr>
@@ -1732,18 +1873,19 @@ ADMIN_TEMPLATE = """
     
     <div id="admins" class="tab">
         <div class="card">
-            <h3>Add Admin</h3>
+            <h3><i class="fas fa-user-plus"></i> Add Admin</h3>
             <input id="newAdmin" placeholder="Telegram User ID (e.g. 1234567890)">
-            <button class="btn" onclick="addAdmin()">Add Admin</button>
+            <button class="btn btn-block" onclick="addAdmin()"><i class="fas fa-plus"></i> Add Admin</button>
             <p style="font-size:12px; color:#888; margin-top:10px;">Main Admin ID: {{ ADMIN_ID }}</p>
         </div>
+        
         <div class="card">
-            <h3>Current Admins</h3>
+            <h3><i class="fas fa-users-cog"></i> Current Admins</h3>
             <table>
                 {% for adm in settings.admins %}
                 <tr>
                     <td>{{ adm }}</td>
-                    <td><button class="btn-del" onclick="remAdmin('{{ adm }}')">Remove</button></td>
+                    <td><button class="btn-del" onclick="removeAdmin('{{ adm }}')"><i class="fas fa-trash"></i> Remove</button></td>
                 </tr>
                 {% else %}
                 <tr><td colspan="2" style="text-align:center; color:#888; padding:20px;">No additional admins</td></tr>
@@ -1754,43 +1896,41 @@ ADMIN_TEMPLATE = """
     
     <div id="gifts" class="tab">
         <div class="card">
-            <h3>Create Gift Code</h3>
+            <h3><i class="fas fa-gift"></i> Create Gift Code</h3>
             <div style="display:flex; align-items:center; margin:10px 0;">
                 <input id="giftCode" placeholder="Enter 5-character code" maxlength="5" style="text-transform:uppercase; flex:1;">
-                <button class="gen-btn" onclick="generateCode()">GENERATE</button>
+                <button class="gen-btn" onclick="generateCode()"><i class="fas fa-random"></i> GENERATE</button>
             </div>
             <label>Min Amount (₹)</label><input type="number" id="giftMin" value="10" step="0.01">
             <label>Max Amount (₹)</label><input type="number" id="giftMax" value="50" step="0.01">
             <label>Expiry (Hours)</label><input type="number" id="giftExpiry" value="2">
             <label>Total Uses</label><input type="number" id="giftUses" value="1">
-            <button class="btn" onclick="createGift()" style="background:#9d4edd;">Create Gift Code</button>
+            <button class="btn btn-block" onclick="createGift()" style="background:#9d4edd;"><i class="fas fa-plus-circle"></i> Create Gift Code</button>
         </div>
         
         <div class="card">
-            <h3>Active Gift Codes</h3>
+            <h3><i class="fas fa-gifts"></i> Active Gift Codes</h3>
             {% for gift in gifts %}
             <div class="gift-row {% if gift.expired %}expired{% endif %}">
                 <div>
                     <div class="gift-code">{{ gift.code }}</div>
                     <div class="expiry">
                         {% if gift.expired %}
-                        EXPIRED
+                        <i class="fas fa-clock"></i> EXPIRED
                         {% else %}
-                        {% set expiry_time = gift.expiry|fromisoformat %}
-                        {% set remaining = (expiry_time - now).total_seconds() / 60 %}
-                        Expires in: {{ remaining|int }} mins
+                        <i class="fas fa-clock"></i> Expires in: {{ gift.remaining_minutes }} mins
                         {% endif %}
                     </div>
                 </div>
                 <div style="text-align:center;">
-                    <div class="usage">{{ gift.used_by|length }}/{{ gift.total_uses }} uses</div>
-                    <div style="font-size:11px; color:#0f0;">₹{{ gift.min_amount }} - ₹{{ gift.max_amount }}</div>
+                    <div class="usage"><i class="fas fa-users"></i> {{ gift.used_by|length }}/{{ gift.total_uses }} uses</div>
+                    <div style="font-size:11px; color:#0f0;"><i class="fas fa-rupee-sign"></i> {{ gift.min_amount }} - {{ gift.max_amount }}</div>
                 </div>
                 <div>
                     <button class="btn-icon" style="background:#ff9800;" onclick="toggleGift('{{ gift.code }}')" title="Toggle Active">
-                        {% if gift.is_active %}⏸{% else %}▶{% endif %}
+                        {% if gift.is_active %}<i class="fas fa-pause"></i>{% else %}<i class="fas fa-play"></i>{% endif %}
                     </button>
-                    <button class="btn-icon cross" onclick="deleteGift('{{ gift.code }}')" title="Delete">✘</button>
+                    <button class="btn-icon cross" onclick="deleteGift('{{ gift.code }}')" title="Delete"><i class="fas fa-trash"></i></button>
                 </div>
             </div>
             {% else %}
@@ -1801,16 +1941,37 @@ ADMIN_TEMPLATE = """
     
     <div id="bc" class="tab">
         <div class="card">
-            <h3>Broadcast Message</h3>
+            <h3><i class="fas fa-bullhorn"></i> Broadcast Message</h3>
             <textarea id="bcMsg" placeholder="Enter message to send to all users" rows="5"></textarea>
             <input type="file" id="bcFile" accept="image/*">
-            <button class="btn" onclick="sendBC()">Broadcast to All Users</button>
+            <button class="btn btn-block" onclick="sendBroadcast()"><i class="fas fa-paper-plane"></i> Broadcast to All Users</button>
             <p style="font-size:12px; color:#888; margin-top:10px;">This will send to {{ stats.total_users }} users</p>
         </div>
     </div>
     
     <script>
         let curTx = '';
+        
+        function showActionLoader(text = 'Processing...') {
+            document.getElementById('action-loader-text').textContent = text;
+            document.getElementById('action-loading').style.display = 'flex';
+        }
+        
+        function hideActionLoader() {
+            document.getElementById('action-loading').style.display = 'none';
+        }
+        
+        function showToast(message, type = 'info', duration = 3000) {
+            const toast = document.getElementById('toast');
+            toast.textContent = message;
+            toast.className = 'toast';
+            toast.classList.add('toast-' + type);
+            toast.style.display = 'block';
+            
+            setTimeout(() => {
+                toast.style.display = 'none';
+            }, duration);
+        }
         
         function tab(n) {
             document.querySelectorAll('.tab').forEach(e => e.classList.remove('active'));
@@ -1832,6 +1993,8 @@ ADMIN_TEMPLATE = """
                 withdraw_disabled: document.getElementById('withdraw_disabled').checked
             };
             
+            showActionLoader('Saving settings...');
+            
             fetch('/admin/update_basic', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
@@ -1839,19 +2002,21 @@ ADMIN_TEMPLATE = """
             })
             .then(r => r.json())
             .then(data => {
+                hideActionLoader();
                 if (data.ok) {
-                    alert('Settings saved successfully!');
+                    showToast('Settings saved successfully!', 'success');
                 } else {
-                    alert('Error: ' + (data.msg || 'Unknown error'));
+                    showToast('Error: ' + (data.msg || 'Unknown error'), 'error');
                 }
             })
             .catch(err => {
-                alert('Error saving settings');
+                hideActionLoader();
+                showToast('Error saving settings', 'error');
                 console.error(err);
             });
         }
         
-        function addChan() {
+        function addChannel() {
             const data = {
                 action: 'add',
                 name: document.getElementById('cName').value,
@@ -1860,9 +2025,11 @@ ADMIN_TEMPLATE = """
             };
             
             if (!data.name || !data.link) {
-                alert('Please fill channel name and link');
+                showToast('Please fill channel name and link', 'error');
                 return;
             }
+            
+            showActionLoader('Adding channel...');
             
             fetch('/admin/channels', {
                 method: 'POST',
@@ -1871,20 +2038,25 @@ ADMIN_TEMPLATE = """
             })
             .then(r => r.json())
             .then(data => {
+                hideActionLoader();
                 if (data.ok) {
-                    location.reload();
+                    showToast('Channel added successfully!', 'success');
+                    setTimeout(() => location.reload(), 1000);
                 } else {
-                    alert('Error: ' + (data.msg || 'Unknown error'));
+                    showToast('Error: ' + (data.msg || 'Unknown error'), 'error');
                 }
             })
             .catch(err => {
-                alert('Error adding channel');
+                hideActionLoader();
+                showToast('Error adding channel', 'error');
                 console.error(err);
             });
         }
         
-        function delChan(index) {
+        function deleteChannel(index) {
             if (!confirm('Delete this channel?')) return;
+            
+            showActionLoader('Deleting channel...');
             
             fetch('/admin/channels', {
                 method: 'POST',
@@ -1893,14 +2065,17 @@ ADMIN_TEMPLATE = """
             })
             .then(r => r.json())
             .then(data => {
+                hideActionLoader();
                 if (data.ok) {
-                    location.reload();
+                    showToast('Channel deleted successfully!', 'success');
+                    setTimeout(() => location.reload(), 1000);
                 } else {
-                    alert('Error deleting channel');
+                    showToast('Error deleting channel', 'error');
                 }
             })
             .catch(err => {
-                alert('Error deleting channel');
+                hideActionLoader();
+                showToast('Error deleting channel', 'error');
                 console.error(err);
             });
         }
@@ -1908,9 +2083,11 @@ ADMIN_TEMPLATE = """
         function addAdmin() {
             const adminId = document.getElementById('newAdmin').value.trim();
             if (!adminId) {
-                alert('Please enter Telegram User ID');
+                showToast('Please enter Telegram User ID', 'error');
                 return;
             }
+            
+            showActionLoader('Adding admin...');
             
             fetch('/admin/manage_admins', {
                 method: 'POST',
@@ -1919,20 +2096,25 @@ ADMIN_TEMPLATE = """
             })
             .then(r => r.json())
             .then(data => {
+                hideActionLoader();
                 if (data.ok) {
-                    location.reload();
+                    showToast('Admin added successfully!', 'success');
+                    setTimeout(() => location.reload(), 1000);
                 } else {
-                    alert('Error: ' + (data.msg || 'Unknown error'));
+                    showToast('Error: ' + (data.msg || 'Unknown error'), 'error');
                 }
             })
             .catch(err => {
-                alert('Error adding admin');
+                hideActionLoader();
+                showToast('Error adding admin', 'error');
                 console.error(err);
             });
         }
         
-        function remAdmin(id) {
+        function removeAdmin(id) {
             if (!confirm('Remove this admin?')) return;
+            
+            showActionLoader('Removing admin...');
             
             fetch('/admin/manage_admins', {
                 method: 'POST',
@@ -1941,14 +2123,17 @@ ADMIN_TEMPLATE = """
             })
             .then(r => r.json())
             .then(data => {
+                hideActionLoader();
                 if (data.ok) {
-                    location.reload();
+                    showToast('Admin removed successfully!', 'success');
+                    setTimeout(() => location.reload(), 1000);
                 } else {
-                    alert('Error removing admin');
+                    showToast('Error removing admin', 'error');
                 }
             })
             .catch(err => {
-                alert('Error removing admin');
+                hideActionLoader();
+                showToast('Error removing admin', 'error');
                 console.error(err);
             });
         }
@@ -1962,16 +2147,18 @@ ADMIN_TEMPLATE = """
         function confirmApprove() {
             const utr = document.getElementById('utrInput').value.trim();
             if (!utr) {
-                alert('Please enter UTR number');
+                showToast('Please enter UTR number', 'error');
                 return;
             }
             
-            proc(curTx, 'completed', utr);
+            processWithdrawal(curTx, 'completed', utr);
             document.getElementById('approveModal').style.display = 'none';
             document.getElementById('utrInput').value = '';
         }
         
-        function proc(txId, status, utr = '') {
+        function processWithdrawal(txId, status, utr = '') {
+            showActionLoader('Processing withdrawal...');
+            
             fetch('/admin/process_withdraw', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
@@ -1979,26 +2166,31 @@ ADMIN_TEMPLATE = """
             })
             .then(r => r.json())
             .then(data => {
+                hideActionLoader();
                 if (data.ok) {
-                    location.reload();
+                    showToast('Withdrawal processed successfully!', 'success');
+                    setTimeout(() => location.reload(), 1000);
                 } else {
-                    alert('Error: ' + (data.msg || 'Unknown error'));
+                    showToast('Error: ' + (data.msg || 'Unknown error'), 'error');
                 }
             })
             .catch(err => {
-                alert('Error processing withdrawal');
+                hideActionLoader();
+                showToast('Error processing withdrawal', 'error');
                 console.error(err);
             });
         }
         
-        function sendBC() {
+        function sendBroadcast() {
             const message = document.getElementById('bcMsg').value;
             if (!message.trim()) {
-                alert('Please enter a message');
+                showToast('Please enter a message', 'error');
                 return;
             }
             
             if (!confirm(`Send this message to {{ stats.total_users }} users?`)) return;
+            
+            showActionLoader('Sending broadcast...');
             
             const formData = new FormData();
             formData.append('text', message);
@@ -2013,26 +2205,30 @@ ADMIN_TEMPLATE = """
             })
             .then(r => r.json())
             .then(data => {
+                hideActionLoader();
                 if (data.ok !== false) {
-                    alert(`Message sent to ${data.count || data} users!`);
+                    showToast(`Message sent to ${data.count || data} users!`, 'success');
                     document.getElementById('bcMsg').value = '';
                     document.getElementById('bcFile').value = '';
                 } else {
-                    alert('Error: ' + (data.msg || 'Unknown error'));
+                    showToast('Error: ' + (data.msg || 'Unknown error'), 'error');
                 }
             })
             .catch(err => {
-                alert('Error broadcasting message');
+                hideActionLoader();
+                showToast('Error broadcasting message', 'error');
                 console.error(err);
             });
         }
         
-        function upLogo() {
+        function uploadLogo() {
             const fileInput = document.getElementById('logoFile');
             if (!fileInput.files[0]) {
-                alert('Please select a logo file');
+                showToast('Please select a logo file', 'error');
                 return;
             }
+            
+            showActionLoader('Uploading logo...');
             
             const formData = new FormData();
             formData.append('logo', fileInput.files[0]);
@@ -2043,24 +2239,26 @@ ADMIN_TEMPLATE = """
             })
             .then(r => r.json())
             .then(data => {
+                hideActionLoader();
                 if (data.ok) {
-                    alert('Logo uploaded successfully!');
+                    showToast('Logo uploaded successfully!', 'success');
                     fileInput.value = '';
                 } else {
-                    alert('Error: ' + (data.msg || 'Unknown error'));
+                    showToast('Error: ' + (data.msg || 'Unknown error'), 'error');
                 }
             })
             .catch(err => {
-                alert('Error uploading logo');
+                hideActionLoader();
+                showToast('Error uploading logo', 'error');
                 console.error(err);
             });
         }
         
         function searchUsers(input) {
             const value = input.value.toLowerCase();
-            const rows = document.querySelectorAll('#uTable tr');
+            const rows = document.querySelectorAll('#uTable tbody tr');
             
-            for (let i = 1; i < rows.length; i++) {
+            for (let i = 0; i < rows.length; i++) {
                 const row = rows[i];
                 const text = row.textContent.toLowerCase();
                 row.style.display = text.includes(value) ? '' : 'none';
@@ -2084,14 +2282,16 @@ ADMIN_TEMPLATE = """
             const uses = document.getElementById('giftUses').value;
             
             if (!code || code.length !== 5) {
-                alert('Please enter a valid 5-character code');
+                showToast('Please enter a valid 5-character code', 'error');
                 return;
             }
             
             if (parseFloat(minAmt) >= parseFloat(maxAmt)) {
-                alert('Max amount must be greater than min amount');
+                showToast('Max amount must be greater than min amount', 'error');
                 return;
             }
+            
+            showActionLoader('Creating gift code...');
             
             const data = {
                 auto_generate: false,
@@ -2109,20 +2309,24 @@ ADMIN_TEMPLATE = """
             })
             .then(r => r.json())
             .then(data => {
+                hideActionLoader();
                 if (data.ok) {
-                    alert('Gift code created: ' + data.code);
-                    location.reload();
+                    showToast('Gift code created: ' + data.code, 'success');
+                    setTimeout(() => location.reload(), 1000);
                 } else {
-                    alert('Error: ' + data.msg);
+                    showToast('Error: ' + data.msg, 'error');
                 }
             })
             .catch(err => {
-                alert('Error creating gift code');
+                hideActionLoader();
+                showToast('Error creating gift code', 'error');
                 console.error(err);
             });
         }
         
         function toggleGift(code) {
+            showActionLoader('Updating gift code...');
+            
             fetch('/admin/toggle_gift', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
@@ -2130,20 +2334,25 @@ ADMIN_TEMPLATE = """
             })
             .then(r => r.json())
             .then(data => {
+                hideActionLoader();
                 if (data.ok) {
-                    location.reload();
+                    showToast('Gift code updated!', 'success');
+                    setTimeout(() => location.reload(), 1000);
                 } else {
-                    alert('Error: ' + (data.msg || 'Unknown error'));
+                    showToast('Error: ' + (data.msg || 'Unknown error'), 'error');
                 }
             })
             .catch(err => {
-                alert('Error toggling gift code');
+                hideActionLoader();
+                showToast('Error toggling gift code', 'error');
                 console.error(err);
             });
         }
         
         function deleteGift(code) {
             if (!confirm('Delete this gift code?')) return;
+            
+            showActionLoader('Deleting gift code...');
             
             fetch('/admin/toggle_gift', {
                 method: 'POST',
@@ -2152,14 +2361,17 @@ ADMIN_TEMPLATE = """
             })
             .then(r => r.json())
             .then(data => {
+                hideActionLoader();
                 if (data.ok) {
-                    location.reload();
+                    showToast('Gift code deleted!', 'success');
+                    setTimeout(() => location.reload(), 1000);
                 } else {
-                    alert('Error: ' + (data.msg || 'Unknown error'));
+                    showToast('Error: ' + (data.msg || 'Unknown error'), 'error');
                 }
             })
             .catch(err => {
-                alert('Error deleting gift code');
+                hideActionLoader();
+                showToast('Error deleting gift code', 'error');
                 console.error(err);
             });
         }
