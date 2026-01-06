@@ -13,6 +13,7 @@ import requests
 import re
 from werkzeug.utils import secure_filename
 import urllib.parse
+import hashlib
 
 # ==================== 1. RAILWAY CONFIGURATION ====================
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '8295150408:AAF1P_IcRG-z8L54PNzZVFKNXts0Uwy0TtY')
@@ -32,6 +33,16 @@ SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 WITHDRAWALS_FILE = os.path.join(DATA_DIR, "withdrawals.json")
 GIFTS_FILE = os.path.join(DATA_DIR, "gifts.json")
 LEADERBOARD_FILE = os.path.join(DATA_DIR, "leaderboard.json")
+
+# Cache for faster loading
+CACHE = {
+    'settings': None,
+    'users': None,
+    'withdrawals': None,
+    'gifts': None,
+    'leaderboard': None,
+    'last_update': 0
+}
 
 # Logging
 logging.basicConfig(
@@ -68,7 +79,8 @@ def init_default_files():
             "withdraw_disabled": False,
             "logo_filename": "logo_default.png",
             "min_refer_reward": 10.0,
-            "max_refer_reward": 50.0
+            "max_refer_reward": 50.0,
+            "app_name": "Cyber Earn"
         },
         WITHDRAWALS_FILE: [],
         GIFTS_FILE: [],
@@ -83,12 +95,20 @@ def init_default_files():
 
 init_default_files()
 
-# ==================== 2. DATA MANAGEMENT ====================
-def load_json(filepath, default):
+# ==================== 2. DATA MANAGEMENT (CACHED) ====================
+def load_json_cached(filepath, default, cache_key=None):
     try:
+        # Use cache if available and recent (10 seconds)
+        if cache_key and CACHE[cache_key] and (time.time() - CACHE['last_update'] < 10):
+            return CACHE[cache_key]
+            
         if os.path.exists(filepath):
             with open(filepath, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                data = json.load(f)
+                if cache_key:
+                    CACHE[cache_key] = data
+                    CACHE['last_update'] = time.time()
+                return data
         return default
     except Exception as e:
         logger.error(f"Error loading {filepath}: {e}")
@@ -97,13 +117,28 @@ def load_json(filepath, default):
 def save_json(filepath, data):
     try:
         with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=4)
+            json.dump(data, f, indent=4, ensure_ascii=False)
+        
+        # Invalidate cache
+        if 'settings' in filepath:
+            CACHE['settings'] = None
+        elif 'users' in filepath:
+            CACHE['users'] = None
+        elif 'withdrawals' in filepath:
+            CACHE['withdrawals'] = None
+        elif 'gifts' in filepath:
+            CACHE['gifts'] = None
+        
+        CACHE['last_update'] = time.time()
         return True
     except Exception as e:
         logger.error(f"Error saving {filepath}: {e}")
         return False
 
 def get_settings():
+    if CACHE['settings'] and (time.time() - CACHE['last_update'] < 5):
+        return CACHE['settings']
+    
     defaults = {
         "bot_name": "CYBER EARN ULTIMATE",
         "min_withdrawal": 100.0,
@@ -116,12 +151,14 @@ def get_settings():
         "withdraw_disabled": False,
         "logo_filename": "logo_default.png",
         "min_refer_reward": 10.0,
-        "max_refer_reward": 50.0
+        "max_refer_reward": 50.0,
+        "app_name": "Cyber Earn"
     }
-    current = load_json(SETTINGS_FILE, defaults)
+    current = load_json_cached(SETTINGS_FILE, defaults, 'settings')
     for k, v in defaults.items():
         if k not in current:
             current[k] = v
+    CACHE['settings'] = current
     return current
 
 def is_admin(user_id):
@@ -139,10 +176,21 @@ def safe_send_message(chat_id, text, reply_markup=None):
 def get_user_full_name(user):
     name_parts = []
     if user.first_name:
-        name_parts.append(user.first_name)
+        # Remove special characters and emojis for display
+        clean_name = re.sub(r'[^\w\s]', '', user.first_name)
+        if clean_name.strip():
+            name_parts.append(clean_name)
     if user.last_name:
-        name_parts.append(user.last_name)
+        clean_last = re.sub(r'[^\w\s]', '', user.last_name)
+        if clean_last.strip():
+            name_parts.append(clean_last)
     return " ".join(name_parts) if name_parts else "User"
+
+def get_user_display_name(user):
+    """Get user's username or cleaned name"""
+    if user.username:
+        return f"@{user.username}"
+    return get_user_full_name(user)
 
 def generate_code(length=5):
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
@@ -150,9 +198,14 @@ def generate_code(length=5):
 def generate_refer_code():
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=7))
 
+def generate_device_fingerprint(ip, user_agent, other_data=""):
+    """Generate a unique device fingerprint"""
+    data = f"{ip}|{user_agent}|{other_data}"
+    return hashlib.md5(data.encode()).hexdigest()
+
 def update_leaderboard():
     try:
-        users = load_json(USERS_FILE, {})
+        users = load_json_cached(USERS_FILE, {}, 'users')
         leaderboard = []
         for uid, user_data in users.items():
             leaderboard.append({
@@ -163,18 +216,22 @@ def update_leaderboard():
             })
         leaderboard.sort(key=lambda x: x["balance"], reverse=True)
         leaderboard = leaderboard[:20]
+        
         data = {"last_updated": datetime.now().isoformat(), "data": leaderboard}
         save_json(LEADERBOARD_FILE, data)
+        CACHE['leaderboard'] = data
         return data
     except Exception as e:
         logger.error(f"Error updating leaderboard: {e}")
         return {"last_updated": datetime.now().isoformat(), "data": []}
 
 def check_gift_code_expiry():
-    gifts = load_json(GIFTS_FILE, [])
+    gifts = load_json_cached(GIFTS_FILE, [], 'gifts')
     updated = False
     current_time = datetime.now()
+    
     for gift in gifts[:]:
+        # Check expiry time
         if "expiry" in gift:
             try:
                 expiry_time = datetime.fromisoformat(gift["expiry"])
@@ -183,6 +240,13 @@ def check_gift_code_expiry():
                     updated = True
             except:
                 pass
+        
+        # Check if usage limit reached
+        if not gift.get('expired') and 'used_by' in gift and 'total_uses' in gift:
+            if len(gift['used_by']) >= gift['total_uses']:
+                gift["expired"] = True
+                updated = True
+    
     if updated:
         save_json(GIFTS_FILE, gifts)
     return gifts
@@ -251,7 +315,7 @@ def handle_start(message):
         if len(message.text.split()) > 1:
             refer_code = message.text.split()[1]
         
-        users = load_json(USERS_FILE, {})
+        users = load_json_cached(USERS_FILE, {}, 'users')
         is_new = uid not in users
         
         if is_new:
@@ -264,31 +328,36 @@ def handle_start(message):
                 "balance": 0.0,
                 "verified": False,
                 "name": full_name,
+                "username": message.from_user.username,
                 "joined_date": datetime.now().isoformat(),
                 "ip": None,
                 "device_id": None,
+                "device_verified": False,
                 "refer_code": user_refer_code,
                 "referred_by": refer_code if refer_code else None,
                 "referred_users": [],
-                "claimed_gifts": []
+                "claimed_gifts": [],
+                "last_channel_check": None
             }
             save_json(USERS_FILE, users)
             
             msg = f"🔔 *New User*\nName: {full_name}\nID: `{uid}`"
+            if message.from_user.username:
+                msg += f"\nUsername: @{message.from_user.username}"
             if refer_code:
                 msg += f"\nReferred by: `{refer_code}`"
             safe_send_message(ADMIN_ID, msg)
             for adm in settings.get('admins', []):
                 safe_send_message(adm, msg)
         
-        display_name = message.from_user.first_name or "USER"
-        # Remove emojis and encode for URL
-        display_name_clean = re.sub(r'[^\w\s]', '', display_name)
-        if not display_name_clean.strip():
-            display_name_clean = "USER"
-        display_name_encoded = urllib.parse.quote(display_name_clean)
+        display_name = get_user_display_name(message.from_user)
+        # Remove special characters for URL encoding
+        clean_display_name = re.sub(r'[^\w\s]', '', display_name)
+        if not clean_display_name.strip():
+            clean_display_name = settings.get('app_name', 'USER')
         
-        img_url = f"https://res.cloudinary.com/dneusgyzc/image/upload/l_text:Stalinist%20One_130_bold_center:{display_name_encoded},co_white,g_center/v1767253426/botpy_fdkyke.jpg"
+        clean_display_name = urllib.parse.quote(clean_display_name)
+        img_url = f"https://res.cloudinary.com/dneusgyzc/image/upload/l_text:Stalinist%20One_130_bold_center:{clean_display_name},co_white,g_center/v1767253426/botpy_fdkyke.jpg"
         
         markup = InlineKeyboardMarkup(row_width=1)
         for ch in settings['channels']:
@@ -322,11 +391,26 @@ def mini_app():
         if not uid:
             return "User ID required", 400
             
-        users = load_json(USERS_FILE, {})
         settings = get_settings()
-        user = users.get(str(uid), {"name": "Guest", "balance": 0.0, "verified": False})
         
-        leaderboard_data = load_json(LEADERBOARD_FILE, {"last_updated": "2000-01-01", "data": []})
+        # Preload data in background for faster response
+        users_future = lambda: load_json_cached(USERS_FILE, {}, 'users')
+        leaderboard_future = lambda: load_json_cached(LEADERBOARD_FILE, {"last_updated": "2000-01-01", "data": []}, 'leaderboard')
+        
+        users = users_future()
+        leaderboard_data = leaderboard_future()
+        
+        user = users.get(str(uid), {"name": "Guest", "balance": 0.0, "verified": False, "device_verified": False})
+        
+        # Check if user needs channel verification
+        needs_channel_check = True
+        if user.get('verified') and user.get('last_channel_check'):
+            try:
+                last_check = datetime.fromisoformat(user['last_channel_check'])
+                if (datetime.now() - last_check).total_seconds() < 300:  # 5 minutes cache
+                    needs_channel_check = False
+            except:
+                pass
         
         return render_template_string(MINI_APP_TEMPLATE, 
             user=user, 
@@ -335,7 +419,8 @@ def mini_app():
             base_url=BASE_URL, 
             timestamp=int(time.time()),
             leaderboard=leaderboard_data.get("data", []),
-            now=datetime.now().isoformat()
+            now=datetime.now().isoformat(),
+            needs_channel_check=needs_channel_check
         )
     except Exception as e:
         logger.error(f"Mini app error: {e}")
@@ -350,10 +435,58 @@ def get_pfp():
             file_id = photos.photos[0][0].file_id
             file_info = bot.get_file(file_id)
             dl_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info.file_path}"
-            return Response(requests.get(dl_url).content, mimetype='image/jpeg')
+            return Response(requests.get(dl_url, timeout=5).content, mimetype='image/jpeg')
     except Exception as e:
         logger.error(f"PFP error: {e}")
     return "No Image", 404
+
+@app.route('/api/check_channels', methods=['POST'])
+def api_check_channels():
+    """Check channel membership only"""
+    try:
+        data = request.json
+        uid = str(data.get('user_id', ''))
+        
+        if not uid:
+            return jsonify({'ok': False, 'msg': 'User ID required'})
+        
+        settings = get_settings()
+        
+        channel_errors = []
+        private_channels_info = []
+        
+        # Check all channels
+        if settings['channels']:
+            for idx, ch in enumerate(settings['channels']):
+                channel_name = ch.get('btn_name', f'Channel {idx+1}')
+                
+                try:
+                    if ch.get('id'):
+                        # Try to get member status
+                        member = bot.get_chat_member(ch['id'], uid)
+                        if member.status not in ['member', 'administrator', 'creator', 'restricted']:
+                            channel_errors.append(channel_name)
+                except:
+                    channel_errors.append(channel_name)
+        
+        if channel_errors:
+            return jsonify({
+                'ok': False, 
+                'msg': f"Please join: {', '.join(channel_errors)}", 
+                'type': 'channels'
+            })
+        
+        # Update last channel check time
+        users = load_json_cached(USERS_FILE, {}, 'users')
+        if uid in users:
+            users[uid]['last_channel_check'] = datetime.now().isoformat()
+            save_json(USERS_FILE, users)
+        
+        return jsonify({'ok': True, 'msg': 'All channels verified'})
+    
+    except Exception as e:
+        logger.error(f"Check channels error: {e}")
+        return jsonify({'ok': False, 'msg': f"Error: {str(e)}"})
 
 @app.route('/api/verify', methods=['POST'])
 def api_verify():
@@ -361,170 +494,157 @@ def api_verify():
         data = request.json
         uid = str(data.get('user_id', ''))
         fp = str(data.get('fp', ''))
+        user_agent = request.headers.get('User-Agent', '')
         client_ip = request.remote_addr
         
         if not uid:
             return jsonify({'ok': False, 'msg': 'User ID required'})
         
-        users = load_json(USERS_FILE, {})
+        users = load_json_cached(USERS_FILE, {}, 'users')
         settings = get_settings()
         
         if uid not in users:
             return jsonify({'ok': False, 'msg': 'User not found'})
         
-        if users[uid].get('verified'):
-            return jsonify({'ok': True, 'msg': 'Already verified', 'verified': True, 'balance': users[uid].get('balance', 0)})
+        # Generate proper device fingerprint
+        device_fingerprint = generate_device_fingerprint(client_ip, user_agent, fp)
         
         verification_steps = []
         channel_errors = []
-        private_channels_info = []
         
-        # Step 1: Check device verification (if enabled)
+        # Step 1: Check device verification (if enabled and not already verified)
         if not settings.get('ignore_device_check', False) and fp and fp != 'skip':
-            verification_steps.append({"step": "device", "status": "checking", "message": "Checking device..."})
-            device_error = None
-            for u_id, u_data in users.items():
-                if u_id == uid: 
-                    continue
-                if u_data.get('verified') and str(u_data.get('device_id', '')) == fp:
-                    device_error = 'Device already used by another account!'
-                    break
-            
-            if device_error:
-                verification_steps.append({"step": "device", "status": "failed", "message": device_error})
-                return jsonify({
-                    'ok': False, 
-                    'msg': device_error, 
-                    'type': 'device',
-                    'steps': verification_steps
-                })
-            else:
-                verification_steps.append({"step": "device", "status": "passed", "message": "Device verified ✓"})
+            if not users[uid].get('device_verified'):
+                verification_steps.append({"step": "device", "status": "checking", "message": "Checking device..."})
+                
+                # Check for same device across different accounts
+                device_error = None
+                for u_id, u_data in users.items():
+                    if u_id == uid: 
+                        continue
+                    if u_data.get('device_verified') and str(u_data.get('device_id', '')) == device_fingerprint:
+                        device_error = '⚠️ Device already used by another account! Please use a different device or clear browser data.'
+                        break
+                
+                if device_error:
+                    verification_steps.append({"step": "device", "status": "failed", "message": device_error})
+                    return jsonify({
+                        'ok': False, 
+                        'msg': device_error, 
+                        'type': 'device',
+                        'steps': verification_steps,
+                        'retry': True
+                    })
+                else:
+                    users[uid]['device_id'] = device_fingerprint
+                    users[uid]['device_verified'] = True
+                    verification_steps.append({"step": "device", "status": "passed", "message": "Device verified ✓"})
         
-        # Step 2: Check all channels
+        # Step 2: Check all channels (always check)
+        verification_steps.append({"step": "channels", "status": "checking", "message": "Checking channel memberships..."})
+        
         if settings['channels']:
             for idx, ch in enumerate(settings['channels']):
                 channel_name = ch.get('btn_name', f'Channel {idx+1}')
-                verification_steps.append({"step": f"channel_{idx}", "status": "checking", "message": f"Checking {channel_name}..."})
                 
                 try:
                     if ch.get('id'):
                         # Try to get member status
                         member = bot.get_chat_member(ch['id'], uid)
-                        if member.status in ['member', 'administrator', 'creator', 'restricted']:
-                            verification_steps.append({"step": f"channel_{idx}", "status": "passed", "message": f"{channel_name}: Already member ✓"})
-                        else:
-                            # Check if channel is private (bot is admin)
-                            try:
-                                bot_member = bot.get_chat_member(ch['id'], bot.get_me().id)
-                                if bot_member.status in ['administrator', 'creator']:
-                                    # Try to approve join request
-                                    try:
-                                        bot.approve_chat_join_request(ch['id'], uid)
-                                        verification_steps.append({"step": f"channel_{idx}", "status": "passed", "message": f"{channel_name}: Request approved ✓"})
-                                        time.sleep(1)  # Small delay for Telegram API
-                                    except Exception as e:
-                                        if "CHAT_JOIN_REQUEST_NOT_FOUND" in str(e):
-                                            verification_steps.append({"step": f"channel_{idx}", "status": "pending", "message": f"{channel_name}: Request sent ✓"})
-                                            private_channels_info.append({
-                                                'name': channel_name,
-                                                'link': ch.get('link', '#'),
-                                                'status': 'pending'
-                                            })
-                                        else:
-                                            channel_errors.append(channel_name)
-                                            verification_steps.append({"step": f"channel_{idx}", "status": "failed", "message": f"{channel_name}: Error processing"})
-                                else:
-                                    channel_errors.append(channel_name)
-                                    verification_steps.append({"step": f"channel_{idx}", "status": "failed", "message": f"{channel_name}: Please join"})
-                            except Exception as e:
-                                channel_errors.append(channel_name)
-                                verification_steps.append({"step": f"channel_{idx}", "status": "failed", "message": f"{channel_name}: Cannot access"})
-                except Exception as e:
+                        if member.status not in ['member', 'administrator', 'creator', 'restricted']:
+                            channel_errors.append(channel_name)
+                except:
                     channel_errors.append(channel_name)
-                    verification_steps.append({"step": f"channel_{idx}", "status": "failed", "message": f"{channel_name}: Error checking"})
         
         # Return specific errors
         if channel_errors:
+            verification_steps.append({"step": "channels", "status": "failed", "message": f"Please join: {', '.join(channel_errors)}"})
             return jsonify({
                 'ok': False, 
                 'msg': f"Please join: {', '.join(channel_errors)}", 
                 'type': 'channels',
                 'steps': verification_steps,
-                'private_channels': private_channels_info
+                'retry': True
             })
         
-        # All checks passed - give bonus
-        try: 
-            bonus = float(settings.get('welcome_bonus', 50))
-        except: 
-            bonus = 50.0
+        verification_steps.append({"step": "channels", "status": "passed", "message": "All channels verified ✓"})
         
-        users[uid].update({
-            'verified': True, 
-            'device_id': fp if fp != 'skip' else users[uid].get('device_id', ''),
-            'ip': client_ip,
-            'balance': float(users[uid].get('balance', 0)) + bonus
-        })
-        
-        # Give referral bonus to referrer ONLY when referred user verifies
-        if users[uid].get('referred_by'):
-            refer_code = users[uid]['referred_by']
-            for referrer_id, referrer_data in users.items():
-                if referrer_data.get('refer_code') == refer_code:
-                    if uid not in referrer_data.get('referred_users', []):
-                        min_reward = float(settings.get('min_refer_reward', 10))
-                        max_reward = float(settings.get('max_refer_reward', 50))
-                        reward = random.uniform(min_reward, max_reward)
-                        reward = round(reward, 2)
-                        
-                        referrer_data['balance'] = float(referrer_data.get('balance', 0)) + reward
-                        if 'referred_users' not in referrer_data:
-                            referrer_data['referred_users'] = []
-                        referrer_data['referred_users'].append(uid)
-                        
-                        w_list = load_json(WITHDRAWALS_FILE, [])
-                        w_list.append({
-                            "tx_id": f"REF-VERIFY-{generate_code(5)}",
-                            "user_id": referrer_id,
-                            "name": "Referral Bonus (Verified)",
-                            "amount": reward,
-                            "upi": "-",
-                            "status": "completed",
-                            "date": datetime.now().strftime("%Y-%m-%d %H:%M")
-                        })
-                        save_json(WITHDRAWALS_FILE, w_list)
-                        
-                        safe_send_message(referrer_id, f"🎉 *Referral Bonus!*\nYou earned ₹{reward} for {users[uid]['name']}'s verification")
-                    break
+        # All checks passed - give bonus if first time verification
+        if not users[uid].get('verified'):
+            try: 
+                bonus = float(settings.get('welcome_bonus', 50))
+            except: 
+                bonus = 50.0
+            
+            users[uid].update({
+                'verified': True,
+                'ip': client_ip,
+                'last_channel_check': datetime.now().isoformat(),
+                'balance': float(users[uid].get('balance', 0)) + bonus
+            })
+            
+            # Give referral bonus to referrer ONLY when referred user verifies
+            if users[uid].get('referred_by'):
+                refer_code = users[uid]['referred_by']
+                for referrer_id, referrer_data in users.items():
+                    if referrer_data.get('refer_code') == refer_code:
+                        if uid not in referrer_data.get('referred_users', []):
+                            min_reward = float(settings.get('min_refer_reward', 10))
+                            max_reward = float(settings.get('max_refer_reward', 50))
+                            reward = random.uniform(min_reward, max_reward)
+                            reward = round(reward, 2)
+                            
+                            referrer_data['balance'] = float(referrer_data.get('balance', 0)) + reward
+                            if 'referred_users' not in referrer_data:
+                                referrer_data['referred_users'] = []
+                            referrer_data['referred_users'].append(uid)
+                            
+                            w_list = load_json_cached(WITHDRAWALS_FILE, [], 'withdrawals')
+                            w_list.append({
+                                "tx_id": f"REF-VERIFY-{generate_code(5)}",
+                                "user_id": referrer_id,
+                                "name": "Referral Bonus (Verified)",
+                                "amount": reward,
+                                "upi": "-",
+                                "status": "completed",
+                                "date": datetime.now().strftime("%Y-%m-%d %H:%M")
+                            })
+                            save_json(WITHDRAWALS_FILE, w_list)
+                            
+                            safe_send_message(referrer_id, f"🎉 *Referral Bonus!*\nYou earned ₹{reward} for {users[uid]['name']}'s verification")
+                        break
+            
+            w_list = load_json_cached(WITHDRAWALS_FILE, [], 'withdrawals')
+            w_list.append({
+                "tx_id": "BONUS", 
+                "user_id": uid, 
+                "name": "Signup Bonus",
+                "amount": bonus, 
+                "upi": "-", 
+                "status": "completed",
+                "date": datetime.now().strftime("%Y-%m-%d %H:%M")
+            })
+            save_json(WITHDRAWALS_FILE, w_list)
+            
+            verification_steps.append({"step": "bonus", "status": "passed", "message": f"₹{bonus} bonus added ✓"})
+        else:
+            # Already verified, just update channel check time
+            users[uid]['last_channel_check'] = datetime.now().isoformat()
         
         save_json(USERS_FILE, users)
         
-        w_list = load_json(WITHDRAWALS_FILE, [])
-        w_list.append({
-            "tx_id": "BONUS", 
-            "user_id": uid, 
-            "name": "Signup Bonus",
-            "amount": bonus, 
-            "upi": "-", 
-            "status": "completed",
-            "date": datetime.now().strftime("%Y-%m-%d %H:%M")
-        })
-        save_json(WITHDRAWALS_FILE, w_list)
-        
-        verification_steps.append({"step": "bonus", "status": "passed", "message": f"₹{bonus} bonus added ✓"})
-        
         return jsonify({
             'ok': True, 
-            'bonus': bonus, 
+            'bonus': bonus if 'bonus' in locals() else 0, 
             'balance': users[uid]['balance'], 
             'verified': True,
+            'device_verified': users[uid].get('device_verified', False),
             'steps': verification_steps
         })
     
     except Exception as e:
         logger.error(f"Verify error: {e}")
-        return jsonify({'ok': False, 'msg': f"Error: {str(e)}"})
+        return jsonify({'ok': False, 'msg': f"Error: {str(e)}", 'retry': True})
 
 @app.route('/api/check_verification')
 def api_check_verification():
@@ -533,7 +653,7 @@ def api_check_verification():
         if not uid:
             return jsonify({'ok': False, 'msg': 'User ID required'})
         
-        users = load_json(USERS_FILE, {})
+        users = load_json_cached(USERS_FILE, {}, 'users')
         if uid not in users:
             return jsonify({'ok': False, 'msg': 'User not found'})
         
@@ -541,6 +661,7 @@ def api_check_verification():
         return jsonify({
             'ok': True,
             'verified': user.get('verified', False),
+            'device_verified': user.get('device_verified', False),
             'balance': float(user.get('balance', 0)),
             'name': user.get('name', 'User')
         })
@@ -559,7 +680,7 @@ def api_withdraw():
             return jsonify({'ok': False, 'msg': 'Invalid Amount'})
         upi = str(data.get('upi', ''))
         
-        users = load_json(USERS_FILE, {})
+        users = load_json_cached(USERS_FILE, {}, 'users')
         settings = get_settings()
         
         if settings.get('withdraw_disabled'):
@@ -608,7 +729,7 @@ def api_withdraw():
             for adm in settings.get('admins', []):
                 safe_send_message(adm, msg_adm, reply_markup=markup)
 
-        w_list = load_json(WITHDRAWALS_FILE, [])
+        w_list = load_json_cached(WITHDRAWALS_FILE, [], 'withdrawals')
         w_list.append(record)
         save_json(WITHDRAWALS_FILE, w_list)
         
@@ -625,25 +746,6 @@ def api_withdraw():
         logger.error(f"Withdraw Error: {e}")
         return jsonify({'ok': False, 'msg': f"Error: {str(e)}"})
 
-@app.route('/api/get_balance')
-def api_get_balance():
-    try:
-        uid = request.args.get('user_id')
-        if not uid:
-            return jsonify({'ok': False, 'msg': 'User ID required'})
-        
-        users = load_json(USERS_FILE, {})
-        user = users.get(str(uid), {})
-        
-        return jsonify({
-            'ok': True,
-            'balance': float(user.get('balance', 0)),
-            'verified': user.get('verified', False)
-        })
-    except Exception as e:
-        logger.error(f"Get balance error: {e}")
-        return jsonify({'ok': False, 'msg': str(e)})
-
 @app.route('/api/history')
 def api_history():
     try:
@@ -651,7 +753,7 @@ def api_history():
         if not uid:
             return jsonify([])
         
-        history = [w for w in load_json(WITHDRAWALS_FILE, []) if w.get('user_id') == uid]
+        history = [w for w in load_json_cached(WITHDRAWALS_FILE, [], 'withdrawals') if w.get('user_id') == uid]
         return jsonify(history[::-1][:10])
     except Exception as e:
         logger.error(f"History error: {e}")
@@ -702,7 +804,7 @@ def api_claim_gift():
         if not uid:
             return jsonify({'ok': False, 'msg': 'User ID required'})
         
-        users = load_json(USERS_FILE, {})
+        users = load_json_cached(USERS_FILE, {}, 'users')
         if uid not in users:
             return jsonify({'ok': False, 'msg': 'User not found'})
         
@@ -737,7 +839,7 @@ def api_claim_gift():
                     gift['used_by'] = []
                 gift['used_by'].append(uid)
                 
-                w_list = load_json(WITHDRAWALS_FILE, [])
+                w_list = load_json_cached(WITHDRAWALS_FILE, [], 'withdrawals')
                 w_list.append({
                     "tx_id": f"GIFT-{generate_code(5)}",
                     "user_id": uid,
@@ -771,7 +873,7 @@ def api_get_refer_info():
         if not uid:
             return jsonify({'ok': False, 'msg': 'User ID required'})
         
-        users = load_json(USERS_FILE, {})
+        users = load_json_cached(USERS_FILE, {}, 'users')
         
         if uid not in users:
             return jsonify({'ok': False, 'msg': 'User not found'})
@@ -840,7 +942,7 @@ def admin_panel():
         if not uid or not is_admin(uid): 
             return "⛔ Unauthorized"
         
-        all_withdrawals = load_json(WITHDRAWALS_FILE, [])
+        all_withdrawals = load_json_cached(WITHDRAWALS_FILE, [], 'withdrawals')
         filtered_withdrawals = []
         for w in all_withdrawals:
             tx_id = w.get('tx_id', '')
@@ -859,16 +961,19 @@ def admin_panel():
                 except:
                     gift['remaining_minutes'] = 0
         
-        users = load_json(USERS_FILE, {})
+        users = load_json_cached(USERS_FILE, {}, 'users')
         user_list = []
         for user_id, user_data in users.items():
             user_list.append({
                 'id': user_id,
                 'name': user_data.get('name', 'Unknown'),
+                'username': user_data.get('username', ''),
                 'balance': float(user_data.get('balance', 0)),
                 'refer_code': user_data.get('refer_code', 'N/A'),
                 'verified': user_data.get('verified', False),
-                'refer_count': len(user_data.get('referred_users', []))
+                'device_verified': user_data.get('device_verified', False),
+                'refer_count': len(user_data.get('referred_users', [])),
+                'joined_date': user_data.get('joined_date', '')
             })
         
         return render_template_string(ADMIN_TEMPLATE, 
@@ -899,6 +1004,7 @@ def admin_update_basic():
             s['welcome_bonus'] = float(d.get('welcome_bonus', 50))
             s['min_refer_reward'] = float(d.get('min_refer_reward', 10))
             s['max_refer_reward'] = float(d.get('max_refer_reward', 50))
+            s['app_name'] = d.get('app_name', 'Cyber Earn')
         except:
             pass
         
@@ -964,7 +1070,7 @@ def admin_channels():
 def admin_process_withdraw():
     try:
         d = request.json
-        w_list = load_json(WITHDRAWALS_FILE, [])
+        w_list = load_json_cached(WITHDRAWALS_FILE, [], 'withdrawals')
         
         for w in w_list:
             if w.get('tx_id') == d.get('tx_id') and w.get('status') == 'pending':
@@ -974,7 +1080,7 @@ def admin_process_withdraw():
                 if d.get('status') == 'completed': 
                     safe_send_message(w['user_id'], f"✅ *Withdrawal Paid!*\nAmt: ₹{w['amount']}\nUTR: `{w['utr']}`\nTxID: `{w['tx_id']}`")
                 else:
-                    users = load_json(USERS_FILE, {})
+                    users = load_json_cached(USERS_FILE, {}, 'users')
                     if w['user_id'] in users:
                         users[w['user_id']]['balance'] = float(users[w['user_id']].get('balance', 0)) + float(w['amount'])
                         save_json(USERS_FILE, users)
@@ -1007,7 +1113,7 @@ def admin_broadcast():
     try:
         txt = request.form.get('text', '')
         f = request.files.get('image')
-        users = load_json(USERS_FILE, {})
+        users = load_json_cached(USERS_FILE, {}, 'users')
         cnt = 0
         
         if f:
@@ -1036,6 +1142,40 @@ def admin_broadcast():
         logger.error(f"Broadcast error: {e}")
         return jsonify({'ok': False, 'msg': str(e)})
 
+@app.route('/admin/send_to_user', methods=['POST'])
+def admin_send_to_user():
+    try:
+        user_id = request.form.get('user_id')
+        txt = request.form.get('text', '')
+        f = request.files.get('image')
+        
+        if not user_id:
+            return jsonify({'ok': False, 'msg': 'User ID required'})
+        
+        if f:
+            filename = secure_filename(f.filename)
+            path = os.path.join(UPLOAD_FOLDER, filename)
+            f.save(path)
+            
+            with open(path, 'rb') as img:
+                idata = img.read()
+                try: 
+                    bot.send_photo(user_id, idata, caption=txt)
+                    os.remove(path)
+                    return jsonify({'ok': True, 'msg': 'Message sent successfully!'})
+                except Exception as e:
+                    os.remove(path)
+                    return jsonify({'ok': False, 'msg': f'Error: {str(e)}'})
+        else:
+            try: 
+                bot.send_message(user_id, txt)
+                return jsonify({'ok': True, 'msg': 'Message sent successfully!'})
+            except Exception as e:
+                return jsonify({'ok': False, 'msg': f'Error: {str(e)}'})
+    except Exception as e:
+        logger.error(f"Send to user error: {e}")
+        return jsonify({'ok': False, 'msg': str(e)})
+
 @app.route('/admin/create_gift', methods=['POST'])
 def admin_create_gift():
     try:
@@ -1048,7 +1188,7 @@ def admin_create_gift():
         elif len(code) != 5 or not code.isalnum():
             return jsonify({'ok': False, 'msg': 'Code must be 5 alphanumeric characters'})
         
-        gifts = load_json(GIFTS_FILE, [])
+        gifts = load_json_cached(GIFTS_FILE, [], 'gifts')
         if any(g.get('code') == code for g in gifts):
             return jsonify({'ok': False, 'msg': 'Code already exists'})
         
@@ -1083,7 +1223,7 @@ def admin_toggle_gift():
         code = data.get('code')
         action = data.get('action')
         
-        gifts = load_json(GIFTS_FILE, [])
+        gifts = load_json_cached(GIFTS_FILE, [], 'gifts')
         
         for gift in gifts:
             if gift.get('code') == code:
@@ -1143,7 +1283,8 @@ MINI_APP_TEMPLATE = """
     <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.6.0/dist/confetti.browser.min.js"></script>
     <style>
         :root { --bg: #050508; --cyan: #00f3ff; --gold: #ffd700; --panel: rgba(255,255,255,0.05); }
-        body { background: radial-gradient(circle at top, #111122, var(--bg)); color: white; font-family: 'Rajdhani', sans-serif; margin: 0; padding: 0; box-sizing: border-box; min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; overflow-x: hidden; width: 100%; }
+        * { box-sizing: border-box; }
+        body { background: radial-gradient(circle at top, #111122, var(--bg)); color: white; font-family: 'Rajdhani', sans-serif; margin: 0; padding: 0; min-height: 100vh; overflow-x: hidden; }
         .hidden { display: none !important; }
         .header { display: flex; align-items: center; justify-content: center; gap: 15px; margin: 15px 0; width: 100%; padding: 0 5%; }
         .logo { width: 50px; height: 50px; border-radius: 50%; border: 2px solid var(--cyan); box-shadow: 0 0 15px rgba(0,243,255,0.3); object-fit: cover; }
@@ -1154,8 +1295,8 @@ MINI_APP_TEMPLATE = """
         .nav-text { font-size: 10px; margin-top: 2px; color: #888; }
         .nav-btn.active { background: rgba(0,243,255,0.15); color: var(--cyan); box-shadow: 0 0 10px rgba(0,243,255,0.3); }
         .nav-btn.active .nav-text { color: var(--cyan); }
-        .tab-content { width: 100%; max-width: 500px; padding: 0 5% 20px 5%; box-sizing: border-box; }
-        .card-metal, .card-gold, .card-silver, .card-purple { width: 100%; box-sizing: border-box; border-radius: 16px; padding: 25px; margin-bottom: 20px; position: relative; overflow: hidden; }
+        .tab-content { width: 100%; max-width: 500px; padding: 0 5% 20px 5%; }
+        .card-metal, .card-gold, .card-silver, .card-purple { width: 100%; border-radius: 16px; padding: 25px; margin-bottom: 20px; position: relative; overflow: hidden; }
         .card-metal { background: linear-gradient(135deg, #e0e0e0 0%, #bdc3c7 20%, #88929e 50%, #bdc3c7 80%, #e0e0e0 100%); border: 1px solid #fff; box-shadow: 0 10px 20px rgba(0,0,0,0.5), inset 0 0 15px rgba(255,255,255,0.5); display: flex; align-items: center; color: #222; }
         .card-metal::before { content: ''; position: absolute; top: 0; left: -150%; width: 60%; height: 100%; background: linear-gradient(90deg, transparent, rgba(255,255,255,0.8), transparent); animation: shine 3.5s infinite; transform: skewX(-20deg); }
         @keyframes shine { 100% { left: 200%; } }
@@ -1175,11 +1316,11 @@ MINI_APP_TEMPLATE = """
         .btn:active { transform: scale(0.95); }
         .btn-purple { background: #5a189a; color: white; }
         .btn-cyan { background: #00f3ff; color: #000; }
-        .popup { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.95); backdrop-filter: blur(5px); display: none; justify-content: center; align-items: center; z-index: 9999; padding: 20px; box-sizing: border-box; }
+        .popup { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.95); backdrop-filter: blur(5px); display: none; justify-content: center; align-items: center; z-index: 9999; padding: 20px; }
         .popup-content { background: #1a1a20; padding: 30px; border-radius: 20px; width: 100%; max-width: 350px; border: 1px solid var(--cyan); text-align: center; box-shadow: 0 0 30px rgba(0,243,255,0.2); }
         .popup-content h3 { margin-top: 0; color: var(--cyan); }
-        input, textarea { width: 100%; padding: 12px; margin: 10px 0; background: #2a2a30; border: 1px solid #444; color: white; border-radius: 8px; box-sizing: border-box; font-family: inherit; }
-        .hist-item { background: var(--panel); border-radius: 8px; padding: 12px; margin-bottom: 8px; display: flex; justify-content: space-between; border-left: 3px solid #333; width: 100%; box-sizing: border-box; }
+        input, textarea { width: 100%; padding: 12px; margin: 10px 0; background: #2a2a30; border: 1px solid #444; color: white; border-radius: 8px; font-family: inherit; }
+        .hist-item { background: var(--panel); border-radius: 8px; padding: 12px; margin-bottom: 8px; display: flex; justify-content: space-between; border-left: 3px solid #333; width: 100%; }
         .status-completed { color: #00ff00; } .status-pending { color: orange; } .status-rejected { color: red; }
         .overlay-loader { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.95); z-index: 2000; display: flex; flex-direction: column; justify-content: center; align-items: center; }
         .spinner { width: 40px; height: 40px; border: 5px solid #333; border-top: 5px solid var(--cyan); border-radius: 50%; animation: spin 1s linear infinite; margin: 20px; }
@@ -1226,17 +1367,18 @@ MINI_APP_TEMPLATE = """
         .step-pending { color: #0088ff; }
         .step-icon { font-size: 14px; width: 20px; text-align: center; }
         .private-channel-info { background: rgba(0,136,255,0.1); border: 1px solid #0088ff; border-radius: 8px; padding: 10px; margin: 10px 0; }
+        .device-error-retry { margin-top: 15px; }
     </style>
 </head>
 <body>
     <div id="loading-screen" class="loading-screen">
-        <img src="{{ base_url }}/static/{{ settings.logo_filename }}?v={{ timestamp }}" class="loading-logo">
+        <img src="{{ base_url }}/static/{{ settings.logo_filename }}?v={{ timestamp }}" class="loading-logo" onerror="this.src='data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iODAiIGhlaWdodD0iODAiIHZpZXdCb3g9IjAgMCA4MCA4MCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48Y2lyY2xlIGN4PSI0MCIgY3k9IjQwIiByPSIzOCIgZmlsbD0iIzAwZjNmZiIgc3Ryb2tlPSIjZmZmIiBzdHJva2Utd2lkdGg9IjIiLz48L3N2Zz4='">
         <div class="loading-text">{{ settings.bot_name }}</div>
         <div class="resource-bar">
             <div class="progress-bar">
-                <div id="resource-progress" class="progress-fill"></div>
+                <div id="resource-progress" class="progress-fill" style="width: 100%;"></div>
             </div>
-            <div id="resource-text" class="resource-text">Initializing system...</div>
+            <div id="resource-text" class="resource-text">Loading...</div>
         </div>
     </div>
     
@@ -1244,7 +1386,6 @@ MINI_APP_TEMPLATE = """
         <div class="spinner"></div>
         <div id="verification-text" class="action-loader">Starting verification...</div>
         <div id="verification-steps" class="verification-steps" style="width: 80%; max-width: 300px; margin-top: 20px;"></div>
-        <div id="private-channels-info" style="width: 80%; max-width: 300px; margin-top: 10px;"></div>
     </div>
     
     <div id="action-loading" class="action-loading">
@@ -1255,7 +1396,7 @@ MINI_APP_TEMPLATE = """
     <div id="toast" class="toast"></div>
     
     <div id="app" class="hidden" style="width:100%; display:flex; flex-direction:column; align-items:center;">
-        <div class="header"><img src="{{ base_url }}/static/{{ settings.logo_filename }}?v={{ timestamp }}" class="logo"><div class="title">{{ settings.bot_name }}</div></div>
+        <div class="header"><img src="{{ base_url }}/static/{{ settings.logo_filename }}?v={{ timestamp }}" class="logo" onerror="this.src='data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNTAiIGhlaWdodD0iNTAiIHZpZXdCb3g9IjAgMCA1MCA1MCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48Y2lyY2xlIGN4PSIyNSIgY3k9IjI1IiByPSIyMyIgZmlsbD0iIzAwZjNmZiIgc3Ryb2tlPSIjZmZmIiBzdHJva2Utd2lkdGg9IjIiLz48L3N2Zz4='"><div class="title">{{ settings.bot_name }}</div></div>
         
         <div class="nav-bar">
             <button class="nav-btn active" onclick="switchTab('home')">
@@ -1278,7 +1419,7 @@ MINI_APP_TEMPLATE = """
         
         <div id="tab-home" class="tab-content">
             <div class="card-metal">
-                <div class="p-pic-wrapper"><img src="/get_pfp?uid={{ user_id }}" class="p-pic" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';"><div class="p-icon"><i class="fas fa-user"></i></div></div>
+                <div class="p-pic-wrapper"><img src="/get_pfp?uid={{ user_id }}&v={{ timestamp }}" class="p-pic" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';"><div class="p-icon"><i class="fas fa-user"></i></div></div>
                 <div style="z-index:2;">
                     <div style="font-size:18px; font-weight:800;">{{ user.name }}</div>
                     <div onclick="openPop('contact')" style="color:#0044cc; font-size:13px; margin-top:5px; cursor:pointer; text-decoration:underline; font-weight:bold;">Contact Admin</div>
@@ -1286,18 +1427,20 @@ MINI_APP_TEMPLATE = """
             </div>
             
             <div class="card-gold" id="balance-card">
-                <div id="glass-overlay" class="glass-overlay {% if user.verified %}hidden{% endif %}">
+                {% if not user.verified or (needs_channel_check and not user.device_verified) %}
+                <div id="glass-overlay" class="glass-overlay">
                     <div style="text-align: center; padding: 20px;">
                         <i class="fas fa-lock" style="font-size: 40px; color: #ff9900; margin-bottom: 15px;"></i>
                         <div style="font-size: 18px; font-weight: bold; color: white;">Account Locked</div>
                         <div style="font-size: 14px; color: #aaa; margin-top: 10px; max-width: 250px;">
-                            Complete verification to unlock your wallet and earn ₹{{ settings.welcome_bonus }}
+                            Complete verification to unlock your wallet{% if user.verified %} and refresh channel access{% endif %}
                         </div>
                         <button class="unlock-btn" onclick="startVerification()">
-                            <i class="fas fa-unlock-alt"></i> UNLOCK NOW
+                            <i class="fas fa-unlock-alt"></i> {% if user.verified %}CHECK CHANNELS{% else %}VERIFY NOW{% endif %}
                         </button>
                     </div>
                 </div>
+                {% endif %}
                 <div style="font-size:14px; font-weight:800; opacity:0.8; letter-spacing:2px;">WALLET BALANCE</div>
                 <div id="balance-amount" style="font-size:48px; font-weight:900; margin:5px 0; text-shadow:0 2px 5px rgba(0,0,0,0.2);">₹{{ "%.2f"|format(user.balance) }}</div>
                 <button class="btn" onclick="openPop('withdraw')" {% if not user.verified %}disabled style="opacity:0.5;"{% endif %}><i class="fas fa-wallet"></i> WITHDRAW</button>
@@ -1397,6 +1540,9 @@ MINI_APP_TEMPLATE = """
         <div class="popup-content">
             <h3>⚠️ Verification Required</h3>
             <p id="verify-error-msg" style="color:#ff9900; margin:15px 0;">Please complete verification to continue</p>
+            <div id="device-error-retry" class="device-error-retry" style="display:none;">
+                <button class="btn" onclick="retryDeviceVerification()" style="background:#0088ff; color:white;">RETRY DEVICE CHECK</button>
+            </div>
             <div id="private-channels-list" style="margin: 15px 0;"></div>
             <div class="verify-actions">
                 <button class="btn" onclick="closePop()" style="background:#f44; color:white;">CLOSE</button>
@@ -1407,64 +1553,63 @@ MINI_APP_TEMPLATE = """
     
     <script>
         const UID = "{{ user_id }}";
+        const IS_VERIFIED = {{ user.verified|lower }};
+        const DEVICE_VERIFIED = {{ user.device_verified|lower }};
+        const NEEDS_CHANNEL_CHECK = {{ needs_channel_check|lower }};
         let referData = null;
-        let isVerified = {{ user.verified|lower }};
-        let resourcesLoaded = false;
+        let isVerified = IS_VERIFIED;
+        let deviceVerified = DEVICE_VERIFIED;
+        let needsChannelCheck = NEEDS_CHANNEL_CHECK;
+        let deviceFingerprint = null;
         
-        // Fast loading - show loading screen first, then app
-        window.onload = function() {
-            simulateResourceLoading();
-        };
+        // Ultra fast loading - show app immediately
+        document.addEventListener('DOMContentLoaded', function() {
+            // Generate device fingerprint
+            generateDeviceFingerprint();
+            
+            // Hide loading screen after minimal time
+            setTimeout(() => {
+                document.getElementById('loading-screen').style.display = 'none';
+                document.getElementById('app').classList.remove('hidden');
+                
+                // Load data in background
+                setTimeout(loadCriticalData, 100);
+            }, 300);
+        });
         
-        function simulateResourceLoading() {
-            let progress = 0;
-            const progressBar = document.getElementById('resource-progress');
-            const resourceText = document.getElementById('resource-text');
+        function generateDeviceFingerprint() {
+            // Collect browser fingerprint data
+            const userAgent = navigator.userAgent;
+            const language = navigator.language;
+            const platform = navigator.platform;
+            const hardwareConcurrency = navigator.hardwareConcurrency || 'unknown';
+            const deviceMemory = navigator.deviceMemory || 'unknown';
+            const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
             
-            const steps = [
-                "Loading core modules...",
-                "Fetching user data...",
-                "Initializing interface...",
-                "Preparing verification system...",
-                "Ready!"
-            ];
+            const fingerprintData = `${userAgent}|${language}|${platform}|${hardwareConcurrency}|${deviceMemory}|${timezone}|${Math.floor(Date.now()/1000/3600)}`;
             
-            let stepIndex = 0;
+            // Simple hash
+            let hash = 0;
+            for (let i = 0; i < fingerprintData.length; i++) {
+                const char = fingerprintData.charCodeAt(i);
+                hash = ((hash << 5) - hash) + char;
+                hash = hash & hash;
+            }
             
-            const interval = setInterval(() => {
-                progress += 20;
-                progressBar.style.width = progress + '%';
-                
-                if (progress <= 20) stepIndex = 0;
-                else if (progress <= 40) stepIndex = 1;
-                else if (progress <= 60) stepIndex = 2;
-                else if (progress <= 80) stepIndex = 3;
-                else stepIndex = 4;
-                
-                resourceText.textContent = steps[stepIndex];
-                
-                if (progress >= 100) {
-                    clearInterval(interval);
-                    setTimeout(() => {
-                        document.getElementById('loading-screen').style.display = 'none';
-                        document.getElementById('app').classList.remove('hidden');
-                        resourcesLoaded = true;
-                        
-                        // Start loading data after UI is visible
-                        setTimeout(() => {
-                            loadCriticalData();
-                        }, 300);
-                    }, 500);
-                }
-            }, 200);
+            deviceFingerprint = Math.abs(hash).toString(16);
+            localStorage.setItem('device_fp', deviceFingerprint);
         }
         
         function loadCriticalData() {
+            // Load history
             loadHistory();
+            
+            // Load refer info
             loadReferInfo();
             
-            if (!isVerified) {
-                console.log('User not verified, showing unlock overlay');
+            // Check if we need to verify
+            if (!isVerified || !deviceVerified || needsChannelCheck) {
+                console.log('Verification needed');
             } else {
                 document.querySelector('#balance-card .btn').disabled = false;
                 document.querySelector('#balance-card .btn').style.opacity = '1';
@@ -1474,24 +1619,30 @@ MINI_APP_TEMPLATE = """
         function startVerification() {
             document.getElementById('verification-process').style.display = 'flex';
             document.getElementById('verification-steps').innerHTML = '';
-            document.getElementById('private-channels-info').innerHTML = '';
+            document.getElementById('device-error-retry').style.display = 'none';
             
             updateVerificationStep('Starting verification process...', 'checking');
             
-            // Generate a simple fingerprint
-            const fingerprint = 'user-' + UID + '-' + Date.now();
+            // Use cached fingerprint or generate new
+            const fp = deviceFingerprint || localStorage.getItem('device_fp') || 'new-device-' + Date.now();
             
             setTimeout(() => {
                 fetch('/api/verify', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({user_id: UID, fp: fingerprint, bot_type: 'main'})
+                    body: JSON.stringify({
+                        user_id: UID, 
+                        fp: fp,
+                        bot_type: 'main'
+                    })
                 })
                 .then(r => r.json())
                 .then(data => {
                     if (data.ok) {
                         // Success - user verified
                         isVerified = true;
+                        deviceVerified = data.device_verified || false;
+                        needsChannelCheck = false;
                         
                         // Update steps visualization
                         if (data.steps) {
@@ -1505,7 +1656,10 @@ MINI_APP_TEMPLATE = """
                             document.getElementById('verification-process').style.display = 'none';
                             
                             // Hide glass overlay
-                            document.getElementById('glass-overlay').classList.add('hidden');
+                            const glassOverlay = document.getElementById('glass-overlay');
+                            if (glassOverlay) {
+                                glassOverlay.classList.add('hidden');
+                            }
                             
                             // Enable withdrawal button
                             const withdrawBtn = document.querySelector('#balance-card .btn');
@@ -1518,14 +1672,18 @@ MINI_APP_TEMPLATE = """
                             }
                             
                             // Show success message
-                            showToast(`✅ Verification successful! ₹${data.bonus || 50} bonus added!`, 'success', 5000);
+                            if (data.bonus > 0) {
+                                showToast(`✅ Verification successful! ₹${data.bonus} bonus added!`, 'success', 5000);
+                            } else {
+                                showToast('✅ Channels verified successfully!', 'success', 3000);
+                            }
                             
                             // Load updated data
                             loadHistory();
                             loadReferInfo();
                             
-                            // Show confetti
-                            if (typeof confetti === 'function') {
+                            // Show confetti for bonus
+                            if (data.bonus > 0 && typeof confetti === 'function') {
                                 confetti({particleCount: 150, spread: 70});
                             }
                         }, 1000);
@@ -1533,7 +1691,7 @@ MINI_APP_TEMPLATE = """
                         // Verification failed
                         setTimeout(() => {
                             document.getElementById('verification-process').style.display = 'none';
-                            showVerificationError(data.msg, data.type, data.private_channels, data.steps);
+                            showVerificationError(data.msg, data.type, data.retry);
                         }, 1000);
                     }
                 })
@@ -1584,39 +1742,30 @@ MINI_APP_TEMPLATE = """
             }
         }
         
-        function showVerificationError(message, errorType, privateChannels, steps) {
+        function showVerificationError(message, errorType, showRetry = false) {
             let errorMsg = message;
-            
-            // Show steps if available
-            if (steps) {
-                const stepsContainer = document.getElementById('verification-steps');
-                stepsContainer.innerHTML = '';
-                steps.forEach(step => {
-                    updateVerificationStep(step.message, step.status);
-                });
-            }
             
             // Update error message in popup
             document.getElementById('verify-error-msg').textContent = errorMsg;
             
-            // Show private channel info if available
-            const privateChannelsList = document.getElementById('private-channels-list');
-            privateChannelsList.innerHTML = '';
-            
-            if (privateChannels && privateChannels.length > 0) {
-                let privateChannelsHtml = '<div class="private-channel-info">';
-                privateChannelsHtml += '<div style="font-weight:bold; color:#0088ff; margin-bottom:5px;">Private Channels:</div>';
-                privateChannels.forEach(channel => {
-                    privateChannelsHtml += `<div style="margin:5px 0;">
-                        <div>${channel.name}</div>
-                        <div style="font-size:12px; color:#aaa;">Status: ${channel.status === 'pending' ? 'Join request sent - waiting for admin approval' : 'Approved'}</div>
-                    </div>`;
-                });
-                privateChannelsHtml += '</div>';
-                privateChannelsList.innerHTML = privateChannelsHtml;
+            // Show device retry button if needed
+            if (showRetry && errorType === 'device') {
+                document.getElementById('device-error-retry').style.display = 'block';
+            } else {
+                document.getElementById('device-error-retry').style.display = 'none';
             }
             
             document.getElementById('pop-verify').style.display = 'flex';
+        }
+        
+        function retryDeviceVerification() {
+            // Clear cached fingerprint and retry
+            localStorage.removeItem('device_fp');
+            deviceFingerprint = null;
+            generateDeviceFingerprint();
+            
+            document.getElementById('pop-verify').style.display = 'none';
+            startVerification();
         }
         
         function retryVerification() {
@@ -1657,8 +1806,6 @@ MINI_APP_TEMPLATE = """
         }
         
         function switchTab(tabName) {
-            if (!resourcesLoaded) return;
-            
             document.querySelectorAll('.nav-btn').forEach(btn => btn.classList.remove('active'));
             event.target.closest('.nav-btn').classList.add('active');
             
@@ -1952,6 +2099,16 @@ ADMIN_TEMPLATE = """
         .admin-spinner { width: 40px; height: 40px; border: 5px solid #333; border-top: 5px solid #007bff; border-radius: 50%; animation: spin 1s linear infinite; margin: 20px; }
         @keyframes spin { to { transform: rotate(360deg); } }
         .admin-loader-text { color: white; font-weight: bold; font-size: 16px; margin-top: 15px; }
+        .user-card { background: #2a2a2a; border-radius: 8px; padding: 12px; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; cursor: pointer; transition: background 0.3s; }
+        .user-card:hover { background: #333; }
+        .user-id { font-family: monospace; font-size: 11px; color: #888; }
+        .user-name { font-weight: bold; margin: 5px 0; }
+        .user-balance { color: #ffd700; font-weight: bold; font-size: 16px; }
+        .user-status { font-size: 11px; padding: 2px 6px; border-radius: 10px; }
+        .status-verified { background: rgba(40,167,69,0.2); color: #28a745; }
+        .status-pending { background: rgba(255,193,7,0.2); color: #ffc107; }
+        .channel-details { font-size: 11px; color: #888; margin-top: 5px; }
+        .channel-id { font-family: monospace; }
     </style>
 </head>
 <body>
@@ -1959,6 +2116,19 @@ ADMIN_TEMPLATE = """
         <div class="admin-spinner"></div>
         <div id="adminLoaderText" class="admin-loader-text">Processing...</div>
     </div>
+    
+    <div id="sendMessageModal" class="modal">
+        <div class="m-content" style="max-width: 400px;">
+            <h3>Send Message to User</h3>
+            <div id="sendToUserInfo" style="text-align: left; margin-bottom: 15px; padding: 10px; background: #2a2a2a; border-radius: 5px;"></div>
+            <textarea id="userMessage" rows="4" placeholder="Enter your message..."></textarea>
+            <input type="file" id="userImage" accept="image/*">
+            <button class="btn" style="background:#28a745" onclick="sendUserMessage()">Send Message</button>
+            <button class="btn" style="background:transparent; color:#f44; margin-top:10px;" onclick="document.getElementById('sendMessageModal').style.display='none'">Cancel</button>
+        </div>
+    </div>
+    
+    <div id="approveModal" class="modal"><div class="m-content"><h3>Enter UTR</h3><input id="utrInput" placeholder="UTR Number"><button class="btn" style="background:#28a745" onclick="confirmApprove()">Confirm Pay</button><button class="btn" style="background:transparent; color:#f44" onclick="document.getElementById('approveModal').style.display='none'">Cancel</button></div></div>
     
     <div class="nav">
         <button class="active" onclick="tab('dash')">Stats</button>
@@ -1970,8 +2140,6 @@ ADMIN_TEMPLATE = """
         <button onclick="tab('gifts')">Gift Codes</button>
         <button onclick="tab('bc')">Broadcast</button>
     </div>
-    
-    <div id="approveModal" class="modal"><div class="m-content"><h3>Enter UTR</h3><input id="utrInput" placeholder="UTR Number"><button class="btn" style="background:#28a745" onclick="confirmApprove()">Confirm Pay</button><button class="btn" style="background:transparent; color:#f44" onclick="document.getElementById('approveModal').style.display='none'">Cancel</button></div></div>
     
     <div id="dash" class="tab active">
         <div class="card">
@@ -2014,26 +2182,45 @@ ADMIN_TEMPLATE = """
 
     <div id="users" class="tab">
         <div class="card">
-            <input placeholder="Search by name or ID" onkeyup="searchUsers(this)">
-            <table id="uTable">
-                <tr><th>ID</th><th>Name</th><th>Bal</th><th>Refers</th><th>Code</th><th>Verified</th></tr>
+            <input placeholder="Search by name, ID or username" onkeyup="searchUsers(this)" style="margin-bottom: 15px;">
+            <div id="usersContainer">
                 {% for user in users %}
-                <tr>
-                    <td class="nowrap">{{ user.id[:8] }}...</td>
-                    <td>{{ user.name }}</td>
-                    <td>{{ "%.2f"|format(user.balance) }}</td>
-                    <td>{{ user.refer_count }}</td>
-                    <td style="font-family:monospace; font-size:11px;">{{ user.refer_code if user.refer_code else 'N/A' }}</td>
-                    <td>{% if user.verified %}✅{% else %}❌{% endif %}</td>
-                </tr>
+                <div class="user-card" onclick="openUserMessage('{{ user.id }}', '{{ user.name|escape }}', '{{ user.username|escape }}', {{ user.balance }}, {{ user.verified }}, {{ user.device_verified }}, '{{ user.refer_code }}', {{ user.refer_count }})">
+                    <div style="flex: 1;">
+                        <div class="user-id">{{ user.id }}</div>
+                        <div class="user-name">
+                            {{ user.name }}
+                            {% if user.username %}
+                            <span style="color: #888; font-size: 11px;">(@{{ user.username }})</span>
+                            {% endif %}
+                        </div>
+                        <div style="display: flex; gap: 15px; margin-top: 5px;">
+                            <div>
+                                <div style="font-size: 11px; color: #888;">Refer Code</div>
+                                <div style="font-family: monospace; font-size: 12px;">{{ user.refer_code }}</div>
+                                <div style="font-size: 10px; color: #666;">{{ user.refer_count }} refers</div>
+                            </div>
+                        </div>
+                    </div>
+                    <div style="text-align: right;">
+                        <div class="user-balance">₹{{ "%.2f"|format(user.balance) }}</div>
+                        <div class="user-status {% if user.verified and user.device_verified %}status-verified{% else %}status-pending{% endif %}">
+                            {% if user.verified and user.device_verified %}✅ Verified{% else %}⏳ Pending{% endif %}
+                        </div>
+                        <div style="font-size: 10px; color: #666; margin-top: 5px;">
+                            {{ user.joined_date[:10] if user.joined_date else 'N/A' }}
+                        </div>
+                    </div>
+                </div>
                 {% endfor %}
-            </table>
+            </div>
         </div>
     </div>
     
     <div id="sets" class="tab">
         <div class="card">
             <label>Bot Name</label><input id="bName" value="{{ settings.bot_name }}">
+            <label>App Display Name</label><input id="appName" value="{{ settings.app_name }}">
             <label>Min Withdraw (₹)</label><input type="number" id="minW" value="{{ settings.min_withdrawal }}">
             <label>Welcome Bonus (₹)</label><input type="number" id="bonus" value="{{ settings.welcome_bonus }}">
             <label>Min Refer Reward (₹)</label><input type="number" id="minRef" value="{{ settings.min_refer_reward }}">
@@ -2069,7 +2256,7 @@ ADMIN_TEMPLATE = """
             <h3>Add Channel</h3>
             <input id="cName" placeholder="Channel Name (e.g. News Channel)">
             <input id="cLink" placeholder="Channel Link (https://t.me/...)">
-            <input id="cId" placeholder="Channel ID (e.g. @channelusername)">
+            <input id="cId" placeholder="Channel ID (e.g. @channelusername or -1001234567890)">
             <button class="btn" onclick="addChan()">Add Channel</button>
             <p style="font-size:12px; color:#888; margin-top:10px;">Users must join these channels to verify</p>
         </div>
@@ -2078,12 +2265,17 @@ ADMIN_TEMPLATE = """
             <table>
                 {% for ch in settings.channels %}
                 <tr>
-                    <td>{{ ch.btn_name }}</td>
-                    <td style="font-size:11px; color:#888;">{{ ch.id }}</td>
+                    <td>
+                        <div style="font-weight: bold;">{{ ch.btn_name }}</div>
+                        <div class="channel-details">
+                            <div>Link: <a href="{{ ch.link }}" target="_blank" style="color: #007bff;">{{ ch.link[:30] }}...</a></div>
+                            <div class="channel-id">ID: {{ ch.id }}</div>
+                        </div>
+                    </td>
                     <td><button class="btn-del" onclick="delChan({{ loop.index0 }})">Delete</button></td>
                 </tr>
                 {% else %}
-                <tr><td colspan="3" style="text-align:center; color:#888; padding:20px;">No channels added</td></tr>
+                <tr><td colspan="2" style="text-align:center; color:#888; padding:20px;">No channels added</td></tr>
                 {% endfor %}
             </table>
         </div>
@@ -2143,7 +2335,7 @@ ADMIN_TEMPLATE = """
                 </div>
                 <div style="text-align:center;">
                     <div class="usage">{{ gift.used_by|length }}/{{ gift.total_uses }} uses</div>
-                    <div style="font-size:11px; color:#0f0;">₹{{ gift.min_amount }} - ₹{{ gift.max_amount }}</div>
+                    <div style="font-size:11px; color:{% if gift.used_by|length >= gift.total_uses %}#f44{% else %}#0f0{% endif %};">₹{{ gift.min_amount }} - ₹{{ gift.max_amount }}</div>
                 </div>
                 <div>
                     <button class="btn-icon" style="background:#ff9800;" onclick="toggleGift('{{ gift.code }}')" title="Toggle Active">
@@ -2170,6 +2362,7 @@ ADMIN_TEMPLATE = """
     
     <script>
         let curTx = '';
+        let selectedUserId = '';
         
         function showAdminLoader(text = 'Processing...') {
             document.getElementById('adminLoaderText').textContent = text;
@@ -2187,10 +2380,75 @@ ADMIN_TEMPLATE = """
             event.target.classList.add('active');
         }
         
+        function openUserMessage(userId, userName, username, balance, verified, deviceVerified, referCode, referCount) {
+            selectedUserId = userId;
+            const userInfo = document.getElementById('sendToUserInfo');
+            userInfo.innerHTML = `
+                <div><strong>User ID:</strong> ${userId}</div>
+                <div><strong>Name:</strong> ${userName} ${username ? '(@' + username + ')' : ''}</div>
+                <div><strong>Balance:</strong> ₹${balance.toFixed(2)}</div>
+                <div><strong>Status:</strong> ${verified && deviceVerified ? '✅ Verified' : '⏳ Pending'}</div>
+                <div><strong>Refer Code:</strong> ${referCode} (${referCount} refers)</div>
+            `;
+            document.getElementById('userMessage').value = '';
+            document.getElementById('userImage').value = '';
+            document.getElementById('sendMessageModal').style.display = 'flex';
+        }
+        
+        function sendUserMessage() {
+            const message = document.getElementById('userMessage').value;
+            const fileInput = document.getElementById('userImage');
+            
+            if (!message.trim()) {
+                alert('Please enter a message');
+                return;
+            }
+            
+            showAdminLoader('Sending message...');
+            
+            const formData = new FormData();
+            formData.append('user_id', selectedUserId);
+            formData.append('text', message);
+            if (fileInput.files[0]) {
+                formData.append('image', fileInput.files[0]);
+            }
+            
+            fetch('/admin/send_to_user', {
+                method: 'POST',
+                body: formData
+            })
+            .then(r => r.json())
+            .then(data => {
+                hideAdminLoader();
+                if (data.ok) {
+                    alert(data.msg);
+                    document.getElementById('sendMessageModal').style.display = 'none';
+                } else {
+                    alert('Error: ' + data.msg);
+                }
+            })
+            .catch(err => {
+                hideAdminLoader();
+                alert('Error sending message');
+                console.error(err);
+            });
+        }
+        
+        function searchUsers(input) {
+            const value = input.value.toLowerCase();
+            const cards = document.querySelectorAll('.user-card');
+            
+            cards.forEach(card => {
+                const text = card.textContent.toLowerCase();
+                card.style.display = text.includes(value) ? '' : 'none';
+            });
+        }
+        
         function saveBasic() {
             showAdminLoader('Saving settings...');
             const data = {
                 bot_name: document.getElementById('bName').value,
+                app_name: document.getElementById('appName').value,
                 min_withdrawal: parseFloat(document.getElementById('minW').value),
                 welcome_bonus: parseFloat(document.getElementById('bonus').value),
                 min_refer_reward: parseFloat(document.getElementById('minRef').value),
@@ -2231,9 +2489,9 @@ ADMIN_TEMPLATE = """
                 id: document.getElementById('cId').value
             };
             
-            if (!data.name || !data.link) {
+            if (!data.name || !data.link || !data.id) {
                 hideAdminLoader();
-                alert('Please fill channel name and link');
+                alert('Please fill all channel details');
                 return;
             }
             
@@ -2453,17 +2711,6 @@ ADMIN_TEMPLATE = """
                 alert('Error uploading logo');
                 console.error(err);
             });
-        }
-        
-        function searchUsers(input) {
-            const value = input.value.toLowerCase();
-            const rows = document.querySelectorAll('#uTable tr');
-            
-            for (let i = 1; i < rows.length; i++) {
-                const row = rows[i];
-                const text = row.textContent.toLowerCase();
-                row.style.display = text.includes(value) ? '' : 'none';
-            }
         }
         
         function generateCode() {
