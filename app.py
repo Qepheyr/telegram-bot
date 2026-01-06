@@ -1,3 +1,4 @@
+
 # app.py - Railway Optimized Version
 import os
 from flask import Flask, request, jsonify, render_template_string, send_from_directory, Response
@@ -14,6 +15,7 @@ import re
 from werkzeug.utils import secure_filename
 import urllib.parse
 import hashlib
+import threading
 
 # ==================== 1. RAILWAY CONFIGURATION ====================
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '8295150408:AAF1P_IcRG-z8L54PNzZVFKNXts0Uwy0TtY')
@@ -34,7 +36,8 @@ WITHDRAWALS_FILE = os.path.join(DATA_DIR, "withdrawals.json")
 GIFTS_FILE = os.path.join(DATA_DIR, "gifts.json")
 LEADERBOARD_FILE = os.path.join(DATA_DIR, "leaderboard.json")
 
-# Cache for faster loading
+# Global cache with lock for thread safety
+cache_lock = threading.Lock()
 CACHE = {
     'settings': None,
     'users': None,
@@ -90,7 +93,7 @@ def init_default_files():
     for filepath, default_data in default_files.items():
         if not os.path.exists(filepath):
             with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(default_data, f, indent=4)
+                json.dump(default_data, f, indent=4, ensure_ascii=False)
             logger.info(f"Created default file: {filepath}")
 
 init_default_files()
@@ -98,18 +101,19 @@ init_default_files()
 # ==================== 2. DATA MANAGEMENT (CACHED) ====================
 def load_json_cached(filepath, default, cache_key=None):
     try:
-        # Use cache if available and recent (10 seconds)
-        if cache_key and CACHE[cache_key] and (time.time() - CACHE['last_update'] < 10):
-            return CACHE[cache_key]
+        with cache_lock:
+            # Use cache if available and recent (5 seconds)
+            if cache_key and CACHE[cache_key] and (time.time() - CACHE['last_update'] < 5):
+                return CACHE[cache_key].copy()  # Return copy to avoid mutation issues
             
-        if os.path.exists(filepath):
-            with open(filepath, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                if cache_key:
-                    CACHE[cache_key] = data
-                    CACHE['last_update'] = time.time()
-                return data
-        return default
+            if os.path.exists(filepath):
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    if cache_key:
+                        CACHE[cache_key] = data
+                        CACHE['last_update'] = time.time()
+                    return data
+            return default
     except Exception as e:
         logger.error(f"Error loading {filepath}: {e}")
         return default
@@ -120,24 +124,26 @@ def save_json(filepath, data):
             json.dump(data, f, indent=4, ensure_ascii=False)
         
         # Invalidate cache
-        if 'settings' in filepath:
-            CACHE['settings'] = None
-        elif 'users' in filepath:
-            CACHE['users'] = None
-        elif 'withdrawals' in filepath:
-            CACHE['withdrawals'] = None
-        elif 'gifts' in filepath:
-            CACHE['gifts'] = None
+        with cache_lock:
+            if 'settings' in filepath:
+                CACHE['settings'] = None
+            elif 'users' in filepath:
+                CACHE['users'] = None
+            elif 'withdrawals' in filepath:
+                CACHE['withdrawals'] = None
+            elif 'gifts' in filepath:
+                CACHE['gifts'] = None
+            CACHE['last_update'] = time.time()
         
-        CACHE['last_update'] = time.time()
         return True
     except Exception as e:
         logger.error(f"Error saving {filepath}: {e}")
         return False
 
 def get_settings():
-    if CACHE['settings'] and (time.time() - CACHE['last_update'] < 5):
-        return CACHE['settings']
+    with cache_lock:
+        if CACHE['settings'] and (time.time() - CACHE['last_update'] < 5):
+            return CACHE['settings'].copy()
     
     defaults = {
         "bot_name": "CYBER EARN ULTIMATE",
@@ -158,8 +164,9 @@ def get_settings():
     for k, v in defaults.items():
         if k not in current:
             current[k] = v
-    CACHE['settings'] = current
-    return current
+    with cache_lock:
+        CACHE['settings'] = current
+    return current.copy()
 
 def is_admin(user_id):
     s = get_settings()
@@ -219,7 +226,8 @@ def update_leaderboard():
         
         data = {"last_updated": datetime.now().isoformat(), "data": leaderboard}
         save_json(LEADERBOARD_FILE, data)
-        CACHE['leaderboard'] = data
+        with cache_lock:
+            CACHE['leaderboard'] = data
         return data
     except Exception as e:
         logger.error(f"Error updating leaderboard: {e}")
@@ -250,6 +258,33 @@ def check_gift_code_expiry():
     if updated:
         save_json(GIFTS_FILE, gifts)
     return gifts
+
+def get_user_status(user_data, settings):
+    """Determine user status based on verification requirements"""
+    if user_data.get('verified', False):
+        # User is verified if they meet current requirements
+        needs_device = not settings.get('ignore_device_check', False)
+        device_ok = user_data.get('device_verified', False) or not needs_device
+        
+        # Check channels
+        channels_ok = True
+        if settings['channels']:
+            # Check if user has passed channel verification
+            last_check = user_data.get('last_channel_check')
+            if last_check:
+                try:
+                    last_check_time = datetime.fromisoformat(last_check)
+                    # Consider channel check valid for 5 minutes
+                    if (datetime.now() - last_check_time).total_seconds() > 300:
+                        channels_ok = False
+                except:
+                    channels_ok = False
+            else:
+                channels_ok = False
+        
+        return "verified" if device_ok and channels_ok else "pending"
+    else:
+        return "pending"
 
 # Custom Jinja2 filter
 def datetime_from_isoformat(value):
@@ -393,24 +428,14 @@ def mini_app():
             
         settings = get_settings()
         
-        # Preload data in background for faster response
-        users_future = lambda: load_json_cached(USERS_FILE, {}, 'users')
-        leaderboard_future = lambda: load_json_cached(LEADERBOARD_FILE, {"last_updated": "2000-01-01", "data": []}, 'leaderboard')
-        
-        users = users_future()
-        leaderboard_data = leaderboard_future()
+        # Fast loading - load data directly
+        users = load_json_cached(USERS_FILE, {}, 'users')
+        leaderboard_data = load_json_cached(LEADERBOARD_FILE, {"last_updated": "2000-01-01", "data": []}, 'leaderboard')
         
         user = users.get(str(uid), {"name": "Guest", "balance": 0.0, "verified": False, "device_verified": False})
         
-        # Check if user needs channel verification
-        needs_channel_check = True
-        if user.get('verified') and user.get('last_channel_check'):
-            try:
-                last_check = datetime.fromisoformat(user['last_channel_check'])
-                if (datetime.now() - last_check).total_seconds() < 300:  # 5 minutes cache
-                    needs_channel_check = False
-            except:
-                pass
+        # Determine user status
+        user_status = get_user_status(user, settings)
         
         return render_template_string(MINI_APP_TEMPLATE, 
             user=user, 
@@ -420,7 +445,7 @@ def mini_app():
             timestamp=int(time.time()),
             leaderboard=leaderboard_data.get("data", []),
             now=datetime.now().isoformat(),
-            needs_channel_check=needs_channel_check
+            user_status=user_status
         )
     except Exception as e:
         logger.error(f"Mini app error: {e}")
@@ -435,58 +460,10 @@ def get_pfp():
             file_id = photos.photos[0][0].file_id
             file_info = bot.get_file(file_id)
             dl_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info.file_path}"
-            return Response(requests.get(dl_url, timeout=5).content, mimetype='image/jpeg')
+            return Response(requests.get(dl_url, timeout=3).content, mimetype='image/jpeg')
     except Exception as e:
         logger.error(f"PFP error: {e}")
     return "No Image", 404
-
-@app.route('/api/check_channels', methods=['POST'])
-def api_check_channels():
-    """Check channel membership only"""
-    try:
-        data = request.json
-        uid = str(data.get('user_id', ''))
-        
-        if not uid:
-            return jsonify({'ok': False, 'msg': 'User ID required'})
-        
-        settings = get_settings()
-        
-        channel_errors = []
-        private_channels_info = []
-        
-        # Check all channels
-        if settings['channels']:
-            for idx, ch in enumerate(settings['channels']):
-                channel_name = ch.get('btn_name', f'Channel {idx+1}')
-                
-                try:
-                    if ch.get('id'):
-                        # Try to get member status
-                        member = bot.get_chat_member(ch['id'], uid)
-                        if member.status not in ['member', 'administrator', 'creator', 'restricted']:
-                            channel_errors.append(channel_name)
-                except:
-                    channel_errors.append(channel_name)
-        
-        if channel_errors:
-            return jsonify({
-                'ok': False, 
-                'msg': f"Please join: {', '.join(channel_errors)}", 
-                'type': 'channels'
-            })
-        
-        # Update last channel check time
-        users = load_json_cached(USERS_FILE, {}, 'users')
-        if uid in users:
-            users[uid]['last_channel_check'] = datetime.now().isoformat()
-            save_json(USERS_FILE, users)
-        
-        return jsonify({'ok': True, 'msg': 'All channels verified'})
-    
-    except Exception as e:
-        logger.error(f"Check channels error: {e}")
-        return jsonify({'ok': False, 'msg': f"Error: {str(e)}"})
 
 @app.route('/api/verify', methods=['POST'])
 def api_verify():
@@ -512,11 +489,13 @@ def api_verify():
         verification_steps = []
         channel_errors = []
         
-        # Step 1: Check device verification (if enabled and not already verified)
-        if not settings.get('ignore_device_check', False) and fp and fp != 'skip':
+        # Step 1: Check device verification (if enabled)
+        needs_device_check = not settings.get('ignore_device_check', False)
+        
+        if needs_device_check and fp and fp != 'skip':
+            verification_steps.append({"step": "device", "status": "checking", "message": "Checking device..."})
+            
             if not users[uid].get('device_verified'):
-                verification_steps.append({"step": "device", "status": "checking", "message": "Checking device..."})
-                
                 # Check for same device across different accounts
                 device_error = None
                 for u_id, u_data in users.items():
@@ -539,6 +518,10 @@ def api_verify():
                     users[uid]['device_id'] = device_fingerprint
                     users[uid]['device_verified'] = True
                     verification_steps.append({"step": "device", "status": "passed", "message": "Device verified ✓"})
+            else:
+                verification_steps.append({"step": "device", "status": "passed", "message": "Device already verified ✓"})
+        elif not needs_device_check:
+            verification_steps.append({"step": "device", "status": "passed", "message": "Device check disabled ✓"})
         
         # Step 2: Check all channels (always check)
         verification_steps.append({"step": "channels", "status": "checking", "message": "Checking channel memberships..."})
@@ -569,8 +552,13 @@ def api_verify():
         
         verification_steps.append({"step": "channels", "status": "passed", "message": "All channels verified ✓"})
         
-        # All checks passed - give bonus if first time verification
-        if not users[uid].get('verified'):
+        # All checks passed
+        users[uid]['last_channel_check'] = datetime.now().isoformat()
+        
+        # Determine if this is first time verification
+        is_first_verification = not users[uid].get('verified', False)
+        
+        if is_first_verification:
             try: 
                 bonus = float(settings.get('welcome_bonus', 50))
             except: 
@@ -579,7 +567,6 @@ def api_verify():
             users[uid].update({
                 'verified': True,
                 'ip': client_ip,
-                'last_channel_check': datetime.now().isoformat(),
                 'balance': float(users[uid].get('balance', 0)) + bonus
             })
             
@@ -628,14 +615,13 @@ def api_verify():
             
             verification_steps.append({"step": "bonus", "status": "passed", "message": f"₹{bonus} bonus added ✓"})
         else:
-            # Already verified, just update channel check time
-            users[uid]['last_channel_check'] = datetime.now().isoformat()
+            verification_steps.append({"step": "bonus", "status": "passed", "message": "Already verified ✓"})
         
         save_json(USERS_FILE, users)
         
         return jsonify({
             'ok': True, 
-            'bonus': bonus if 'bonus' in locals() else 0, 
+            'bonus': bonus if is_first_verification else 0, 
             'balance': users[uid]['balance'], 
             'verified': True,
             'device_verified': users[uid].get('device_verified', False),
@@ -658,12 +644,16 @@ def api_check_verification():
             return jsonify({'ok': False, 'msg': 'User not found'})
         
         user = users[uid]
+        settings = get_settings()
+        status = get_user_status(user, settings)
+        
         return jsonify({
             'ok': True,
             'verified': user.get('verified', False),
             'device_verified': user.get('device_verified', False),
             'balance': float(user.get('balance', 0)),
-            'name': user.get('name', 'User')
+            'name': user.get('name', 'User'),
+            'status': status
         })
     except Exception as e:
         logger.error(f"Check verification error: {e}")
@@ -745,6 +735,25 @@ def api_withdraw():
     except Exception as e:
         logger.error(f"Withdraw Error: {e}")
         return jsonify({'ok': False, 'msg': f"Error: {str(e)}"})
+
+@app.route('/api/get_balance')
+def api_get_balance():
+    try:
+        uid = request.args.get('user_id')
+        if not uid:
+            return jsonify({'ok': False, 'msg': 'User ID required'})
+        
+        users = load_json_cached(USERS_FILE, {}, 'users')
+        user = users.get(str(uid), {})
+        
+        return jsonify({
+            'ok': True,
+            'balance': float(user.get('balance', 0)),
+            'verified': user.get('verified', False)
+        })
+    except Exception as e:
+        logger.error(f"Get balance error: {e}")
+        return jsonify({'ok': False, 'msg': str(e)})
 
 @app.route('/api/history')
 def api_history():
@@ -874,6 +883,7 @@ def api_get_refer_info():
             return jsonify({'ok': False, 'msg': 'User ID required'})
         
         users = load_json_cached(USERS_FILE, {}, 'users')
+        settings = get_settings()
         
         if uid not in users:
             return jsonify({'ok': False, 'msg': 'User not found'})
@@ -898,8 +908,11 @@ def api_get_refer_info():
         
         for ref_uid in referred_users[:20]:
             if ref_uid in users:
-                is_verified = users[ref_uid].get('verified', False)
+                ref_user = users[ref_uid]
+                ref_status = get_user_status(ref_user, settings)
+                is_verified = ref_status == "verified"
                 status = "✅ VERIFIED" if is_verified else "⏳ PENDING"
+                
                 if is_verified:
                     total_verified += 1
                 else:
@@ -907,9 +920,11 @@ def api_get_refer_info():
                     
                 referred_details.append({
                     'id': ref_uid,
-                    'name': users[ref_uid].get('name', 'Unknown'),
+                    'name': ref_user.get('name', 'Unknown'),
+                    'username': ref_user.get('username', ''),
                     'status': status,
-                    'verified': is_verified
+                    'verified': is_verified,
+                    'status_type': ref_status
                 })
         
         return jsonify({
@@ -962,8 +977,11 @@ def admin_panel():
                     gift['remaining_minutes'] = 0
         
         users = load_json_cached(USERS_FILE, {}, 'users')
+        settings = get_settings()
+        
         user_list = []
         for user_id, user_data in users.items():
+            status = get_user_status(user_data, settings)
             user_list.append({
                 'id': user_id,
                 'name': user_data.get('name', 'Unknown'),
@@ -972,6 +990,7 @@ def admin_panel():
                 'refer_code': user_data.get('refer_code', 'N/A'),
                 'verified': user_data.get('verified', False),
                 'device_verified': user_data.get('device_verified', False),
+                'status': status,
                 'refer_count': len(user_data.get('referred_users', [])),
                 'joined_date': user_data.get('joined_date', '')
             })
@@ -1376,7 +1395,7 @@ MINI_APP_TEMPLATE = """
         <div class="loading-text">{{ settings.bot_name }}</div>
         <div class="resource-bar">
             <div class="progress-bar">
-                <div id="resource-progress" class="progress-fill" style="width: 100%;"></div>
+                <div id="resource-progress" class="progress-fill" style="width: 0%;"></div>
             </div>
             <div id="resource-text" class="resource-text">Loading...</div>
         </div>
@@ -1427,7 +1446,7 @@ MINI_APP_TEMPLATE = """
             </div>
             
             <div class="card-gold" id="balance-card">
-                {% if not user.verified or (needs_channel_check and not user.device_verified) %}
+                {% if user_status != 'verified' %}
                 <div id="glass-overlay" class="glass-overlay">
                     <div style="text-align: center; padding: 20px;">
                         <i class="fas fa-lock" style="font-size: 40px; color: #ff9900; margin-bottom: 15px;"></i>
@@ -1443,7 +1462,7 @@ MINI_APP_TEMPLATE = """
                 {% endif %}
                 <div style="font-size:14px; font-weight:800; opacity:0.8; letter-spacing:2px;">WALLET BALANCE</div>
                 <div id="balance-amount" style="font-size:48px; font-weight:900; margin:5px 0; text-shadow:0 2px 5px rgba(0,0,0,0.2);">₹{{ "%.2f"|format(user.balance) }}</div>
-                <button class="btn" onclick="openPop('withdraw')" {% if not user.verified %}disabled style="opacity:0.5;"{% endif %}><i class="fas fa-wallet"></i> WITHDRAW</button>
+                <button class="btn" onclick="openPop('withdraw')" {% if user_status != 'verified' %}disabled style="opacity:0.5;"{% endif %}><i class="fas fa-wallet"></i> WITHDRAW</button>
             </div>
             
             <div style="margin-top:20px; width:100%;">
@@ -1553,28 +1572,47 @@ MINI_APP_TEMPLATE = """
     
     <script>
         const UID = "{{ user_id }}";
+        const USER_STATUS = "{{ user_status }}";
         const IS_VERIFIED = {{ user.verified|lower }};
         const DEVICE_VERIFIED = {{ user.device_verified|lower }};
-        const NEEDS_CHANNEL_CHECK = {{ needs_channel_check|lower }};
         let referData = null;
         let isVerified = IS_VERIFIED;
         let deviceVerified = DEVICE_VERIFIED;
-        let needsChannelCheck = NEEDS_CHANNEL_CHECK;
+        let userStatus = USER_STATUS;
         let deviceFingerprint = null;
         
-        // Ultra fast loading - show app immediately
+        // Ultra fast loading with progress bar
         document.addEventListener('DOMContentLoaded', function() {
             // Generate device fingerprint
             generateDeviceFingerprint();
             
-            // Hide loading screen after minimal time
-            setTimeout(() => {
-                document.getElementById('loading-screen').style.display = 'none';
-                document.getElementById('app').classList.remove('hidden');
+            // Start progress animation
+            let progress = 0;
+            const progressBar = document.getElementById('resource-progress');
+            const resourceText = document.getElementById('resource-text');
+            
+            const progressInterval = setInterval(() => {
+                progress += 10;
+                progressBar.style.width = progress + '%';
                 
-                // Load data in background
-                setTimeout(loadCriticalData, 100);
-            }, 300);
+                if (progress <= 30) resourceText.textContent = "Loading assets...";
+                else if (progress <= 60) resourceText.textContent = "Initializing app...";
+                else if (progress <= 90) resourceText.textContent = "Almost ready...";
+                else resourceText.textContent = "Complete!";
+                
+                if (progress >= 100) {
+                    clearInterval(progressInterval);
+                    
+                    // Hide loading screen and show app
+                    setTimeout(() => {
+                        document.getElementById('loading-screen').style.display = 'none';
+                        document.getElementById('app').classList.remove('hidden');
+                        
+                        // Load data in background
+                        setTimeout(loadCriticalData, 100);
+                    }, 100);
+                }
+            }, 20); // Very fast loading
         });
         
         function generateDeviceFingerprint() {
@@ -1608,7 +1646,7 @@ MINI_APP_TEMPLATE = """
             loadReferInfo();
             
             // Check if we need to verify
-            if (!isVerified || !deviceVerified || needsChannelCheck) {
+            if (userStatus !== 'verified') {
                 console.log('Verification needed');
             } else {
                 document.querySelector('#balance-card .btn').disabled = false;
@@ -1642,7 +1680,7 @@ MINI_APP_TEMPLATE = """
                         // Success - user verified
                         isVerified = true;
                         deviceVerified = data.device_verified || false;
-                        needsChannelCheck = false;
+                        userStatus = 'verified';
                         
                         // Update steps visualization
                         if (data.steps) {
@@ -1820,7 +1858,7 @@ MINI_APP_TEMPLATE = """
         }
         
         function submitWithdraw() {
-            if (!isVerified) {
+            if (userStatus !== 'verified') {
                 showToast('Please verify your account first!', 'error');
                 return;
             }
